@@ -1292,6 +1292,7 @@ class ParallelConfig:
 
     pipeline_parallel_size: int = 1  # Number of pipeline parallel groups.
     tensor_parallel_size: int = 1  # Number of tensor parallel groups.
+    expert_parallel_size: int = 1  # Expert parallel ratio.
 
     # Maximum number of multiple batches
     # when load model sequentially. To avoid RAM OOM when using tensor
@@ -1340,6 +1341,7 @@ class ParallelConfig:
         factors: List[Any] = []
         factors.append(self.pipeline_parallel_size)
         factors.append(self.tensor_parallel_size)
+        #factors.append(self.expert_parallel_size)
         return hashlib.sha256(str(factors).encode()).hexdigest()
 
     def __post_init__(self) -> None:
@@ -3358,6 +3360,7 @@ class VllmConfig:
             f" download_dir={self.load_config.download_dir!r}, "
             f"load_format={self.load_config.load_format}, "
             f"tensor_parallel_size={self.parallel_config.tensor_parallel_size},"
+            f"expert_parallel_size={self.parallel_config.expert_parallel_size},"
             f" pipeline_parallel_size={self.parallel_config.pipeline_parallel_size}, "  # noqa
             f"disable_custom_all_reduce={self.parallel_config.disable_custom_all_reduce}, "  # noqa
             f"quantization={self.model_config.quantization}, "

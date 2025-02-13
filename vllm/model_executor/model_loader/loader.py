@@ -26,6 +26,7 @@ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 from vllm.attention import Attention
 from vllm.config import (LoadConfig, LoadFormat, ModelConfig, ParallelConfig,
                          VllmConfig, set_current_vllm_config)
+from vllm.distributed import get_pp_group, get_tp_group
 from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
 from vllm.envs import VLLM_USE_MODELSCOPE
@@ -62,7 +63,7 @@ def hpu_distributed_barrier():
     if is_hpu:
         torch.hpu.synchronize()
         if dist.is_initialized():
-            dist.barrier()
+            get_tp_group().barrier()
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module,

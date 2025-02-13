@@ -18,8 +18,8 @@ from vllm_hpu_extension.profiler import HabanaMemoryProfiler, format_bytes
 
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
-from vllm.distributed import (ensure_model_parallel_initialized,
-                              init_distributed_environment)
+from vllm.distributed import (ensure_model_parallel_initialized, get_pp_group,
+                              get_tp_group, init_distributed_environment)
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
@@ -60,8 +60,9 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         self.rank = rank
         self.distributed_init_method = distributed_init_method
         self.is_driver_worker = is_driver_worker
-        if self.is_driver_worker:
-            assert self.rank == 0, "The driver worker must have rank 0."
+        if self.parallel_config and self.is_driver_worker:
+            assert self.rank % self.parallel_config.tensor_parallel_size == 0, \
+            "The driver worker must have TP rank 0."
 
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
@@ -390,7 +391,8 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         # NOTE(kzawora): We should use virtual engine index here
         # for pipeline parallelism. Using 0 for now.
         assert self.hpu_cache is not None
-        self.model_runner.warmup_model(self.hpu_cache[0])
+        for ve in range(self.parallel_config.pipeline_parallel_size):
+            self.model_runner.warmup_model(self.hpu_cache[ve])
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
@@ -510,7 +512,8 @@ def init_worker_distributed_environment(
                                  backend=backend)
 
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
-                                      parallel_config.pipeline_parallel_size)
+                                      parallel_config.pipeline_parallel_size,
+                                      parallel_config.expert_parallel_size)
 
     if torch.distributed.is_initialized():
         torch_world_size = torch.distributed.get_world_size()
@@ -535,10 +538,11 @@ def init_worker_distributed_environment(
     # A small all_reduce for warmup & checking conformance.
     device = hpu_device_string()
     dummy_tensor_hpu = torch.ones(1).to(device)
-    torch.distributed.all_reduce(dummy_tensor_hpu)
-    assert dummy_tensor_hpu.item() == parallel_config.world_size
+    get_tp_group().all_reduce(dummy_tensor_hpu)
+    assert dummy_tensor_hpu.item() == parallel_config.tensor_parallel_size
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
-                                      parallel_config.pipeline_parallel_size)
+                                      parallel_config.pipeline_parallel_size,
+                                      parallel_config.expert_parallel_size)
 
 
 def raise_if_cache_size_invalid(num_gpu_blocks, block_size,
