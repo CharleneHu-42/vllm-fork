@@ -20,8 +20,8 @@ from vllm_hpu_extension.profiler import HabanaMemoryProfiler, format_bytes
 
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
-from vllm.distributed import (ensure_model_parallel_initialized,
-                              init_distributed_environment)
+from vllm.distributed import (ensure_model_parallel_initialized, get_pp_group,
+                              get_tp_group, init_distributed_environment)
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
@@ -57,14 +57,16 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         is_driver_worker: bool = False,
         model_runner_cls: Optional[Type[HPUModelRunner]] = None,
     ) -> None:
+        #Dlogger.info(f"[STACK_TRACE] HPUWorker.__init__.start")
         WorkerBase.__init__(self, vllm_config=vllm_config)
         self.parallel_config.rank = rank
         self.local_rank = local_rank
         self.rank = rank
         self.distributed_init_method = distributed_init_method
         self.is_driver_worker = is_driver_worker
-        if self.is_driver_worker:
-            assert self.rank == 0, "The driver worker must have rank 0."
+        if self.parallel_config and self.is_driver_worker:
+            assert self.rank % self.parallel_config.tensor_parallel_size == 0, \
+            "The driver worker must have TP rank 0."
 
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
@@ -123,6 +125,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
                 on_trace_ready=fn(torch_profiler_trace_dir, use_gzip=True))
         else:
             self.profiler = None
+        #Dlogger.info(f"[STACK_TRACE] HPUWorker.__init__.end")
 
     def full_trace_handler(self, dir_name, use_gzip=False):
 
@@ -211,6 +214,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         else:
             raise RuntimeError(
                 f"Not support device type: {self.device_config.device}")
+        #Dlogger.info(f"Success! Device: {self.device}, Rank: {self.rank}, Local Rank: {self.local_rank}")
         # Initialize the distributed environment.
         if self.model_config.quantization == 'inc':
             self._set_env_vars()
@@ -234,6 +238,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         self,
         execute_model_req: Optional[ExecuteModelRequest] = None,
     ) -> Optional[List[SamplerOutput]]:
+        #Dlogger.info(f"[STACK_TRACE] HPUWorker.execute_model.start")
         # VLLM_HPU_LOG_STEP_GRAPH_COMPILATION     - will log graph compilations per engine step, only when there was any - highly recommended to use alongside PT_HPU_METRICS_GC_DETAILS! # noqa:E501
         # VLLM_HPU_LOG_STEP_GRAPH_COMPILATION_ALL - will log graph compilations per engine step, always, even if there were none # noqa:E501
         # VLLM_HPU_LOG_STEP_CPU_FALLBACKS         - will log cpu fallbacks per engine step, only when there was any # noqa:E501
@@ -287,11 +292,12 @@ class HPUWorker(LocalOrDistributedWorkerBase):
                 msg = ("VLLM_HPU_STEP_CPU_FALLBACK: "
                        f"{cpu_fallback_local_metric.stats()}, {input_stats}")
                 logger.warning(msg)
-
+            #Dlogger.info(f"[STACK_TRACE] HPUWorker.execute_model.end_1")
             return output
 
         output = LocalOrDistributedWorkerBase.execute_model(
             self, execute_model_req)
+        #Dlogger.info(f"[STACK_TRACE] HPUWorker.execute_model.end_2")
         return output
 
     @torch.inference_mode()
@@ -312,11 +318,13 @@ class HPUWorker(LocalOrDistributedWorkerBase):
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
+        #Dlogger.info(f"[STACK_TRACE] HpuWorker.determine_num_available_blocks.start")
         if is_fake_hpu():
             cache_block_size = self.get_cache_block_size_bytes()
             fake_hpu_cache_alloc = 4 * 2**30  # take 4 GiB flat on fake hpu
             num_fake_hpu_blocks = fake_hpu_cache_alloc // cache_block_size
             self.model_runner.bucketing_ctx.num_hpu_blocks = num_fake_hpu_blocks
+            #Dlogger.info(f"[STACK_TRACE] HpuWorker.determine_num_available_blocks.end_1")
             return num_fake_hpu_blocks, 0
         with HabanaMemoryProfiler() as m:
             self.model_runner.profile_run()
@@ -360,6 +368,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
             self.model_runner.remove_all_loras()
 
         gc.collect()
+        #Dlogger.info(f"[STACK_TRACE] HpuWorker.determine_num_available_blocks.end_2")
         return num_hpu_blocks, num_cpu_blocks
 
     def initialize_cache(self, num_gpu_blocks: int,
@@ -368,6 +377,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
 
         This also warms up the model, which may record CUDA graphs.
         """
+        #Dlogger.info(f"[STACK_TRACE] HPUWorker.initialize_cache.start")
         raise_if_cache_size_invalid(num_gpu_blocks,
                                     self.cache_config.block_size,
                                     self.model_config.max_model_len)
@@ -382,6 +392,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
                f"took {m.get_summary_string()}")
         logger.info(msg)
         self._warm_up_model()
+        #Dlogger.info(f"[STACK_TRACE] HPUWorker.initialize_cache.start")
 
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None
@@ -398,16 +409,17 @@ class HPUWorker(LocalOrDistributedWorkerBase):
                       self.hpu_cache)
 
     def _warm_up_model(self) -> None:
-        # NOTE(kzawora): We should use virtual engine index here
-        # for pipeline parallelism. Using 0 for now.
+        #Dlogger.info(f"[STACK_TRACE] HPUWorker._warm_up_model.start: {get_pp_group().rank}, {get_pp_group().local_rank}, {get_pp_group().rank_in_group}")
         if not isinstance(self.model_runner, HPUPoolingModelRunner):
             assert self.hpu_cache is not None
-            self.model_runner.warmup_model(self.hpu_cache[0])
+            for ve in range(self.parallel_config.pipeline_parallel_size):
+                self.model_runner.warmup_model(self.hpu_cache[0])
         else:
             self.model_runner.warmup_model(None)
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+        #Dlogger.info(f"[STACK_TRACE] HPUWorker._warm_up_model.end")
 
     @property
     def do_metadata_broadcast(self) -> bool:
@@ -539,6 +551,8 @@ def init_worker_distributed_environment(
             "is not already initialized")
     else:
         backend = hpu_backend_string()
+        #Dimport habana_frameworks.torch.distributed.hccl as hccl
+        #Dhccl.initialize_distributed_hpu(world_size=parallel_config.world_size, rank=rank, local_rank=local_rank)
         torch.distributed.init_process_group(
             backend=backend,
             world_size=parallel_config.world_size,
@@ -546,15 +560,145 @@ def init_worker_distributed_environment(
             init_method=distributed_init_method,
         )
 
-    # A small all_reduce for warmup & checking conformance.
-    device = hpu_device_string()
-    dummy_tensor_hpu = torch.ones(1).to(device)
-    torch.distributed.all_reduce(dummy_tensor_hpu)
-    assert dummy_tensor_hpu.item() == parallel_config.world_size
+    # A small all_reduce/all_gather for warmup & checking conformance.
+    test_all_reduce_across_groups(rank, local_rank, parallel_config.world_size)
+    #test_all_gather_across_groups(rank, local_rank, parallel_config.world_size)
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
+    #Dlogger.info(f"Rank {rank} Local Rank {local_rank} Ensure Model Parallel Initialized Success!")
 
+def test_all_reduce_across_groups(rank, local_rank, world_size):
+    #Dlogger.info(f"[Rank={rank}, Local Rank={local_rank}] ==== Distributed Test Info ====")
+    
+    # Basic checks to ensure the distributed environment is set up correctly
+    assert torch.distributed.is_initialized(), f"[Rank={rank}, Local Rank={local_rank}] Distributed environment is not initialized"
+    _rank = torch.distributed.get_rank()
+    assert _rank == rank, f"[Rank={rank}, Local Rank={local_rank}] Rank mismatch: {rank} != {_rank}"
+    _world_size = torch.distributed.get_world_size()
+    assert _world_size == world_size, f"[Rank={rank}, Local Rank={local_rank}] World size mismatch: {world_size} != {_world_size}"
+    visible_modules = os.environ.get("HABANA_VISIBLE_MODULES", "Not set")
+    #Dlogger.info(f"[Rank={rank}, Local Rank={local_rank}] HABANA_VISIBLE_MODULES: {visible_modules}")
+    try:
+        current = torch.hpu.current_device()
+        #Dlogger.info(f"[Rank={rank}, Local Rank={local_rank}] Current HPU device (as reported): {current}")
+    except Exception as e:
+        #Dlogger.info(f"[Rank={rank}, Local Rank={local_rank}] Error getting current HPU device: {e}")
+        pass
 
+    # --- 1) WORLD GROUP ALL-REDUCE ---
+    #logger.info(f"[Rank={rank}, Local Rank={local_rank}] Starting WORLD all-reduce test")
+    #dummy_world = torch.tensor([1.0], device="hpu")
+    #logger.info(f"[Rank={rank}, Local Rank={local_rank}] WORLD dummy before all_reduce: {dummy_world}")
+    #torch.distributed.all_reduce(dummy_world)  # blocking call, but doesn't force code alignment
+    #logger.info(f"[Rank={rank}, Local Rank={local_rank}] WORLD dummy after all_reduce: {dummy_world}")
+    #torch.distributed.barrier()  # Now ensure all ranks hit this barrier
+    #logger.info(f"[Rank={rank}, Local Rank={local_rank}] Completed WORLD all_reduce + barrier: {dummy_world.item()}")
+    #assert dummy_world.item() == world_size, f"[Rank={rank}, Local Rank={local_rank}] World all-reduce failed: {dummy_world.item()} != {world_size}"
+
+    # --- 2) TENSOR PARALLEL (TP) GROUP ALL-REDUCE ---
+    tp_group = get_tp_group()
+    tp_world_size = tp_group.world_size  # number of ranks in the TP group
+    #Dlogger.info(f"[Rank={rank}, Local Rank={local_rank}] TP world size={tp_world_size}")
+    if tp_world_size > 1:
+        dummy_tp = torch.tensor([2.0], device="hpu")
+        #Dlogger.info(f"[Rank={rank}, Local Rank={local_rank}] TP dummy before all_reduce: {dummy_tp}")
+        tp_group.all_reduce(dummy_tp)
+        #Dlogger.info(f"[Rank={rank}, Local Rank={local_rank}] TP dummy after all_reduce: {dummy_tp}")
+        # Some versions of vLLM provide a `barrier()` method on the group
+        # If not, you can do: torch.distributed.barrier(group=tp_group.device_group)
+        tp_group.barrier()
+        #Dlogger.info(f"[Rank={rank}, Local Rank={local_rank}] Completed TP all_reduce + barrier: {dummy_tp.item()}")
+        assert dummy_tp.item() == 2 * tp_world_size, f"[Rank={rank}, Local Rank={local_rank}] TP all-reduce failed: {dummy_tp.item()} != {tp_world_size}"
+    else:
+        #Dlogger.info(f"[Rank={rank}, Local Rank={local_rank}] Skipping TP all_reduce (size=1)")
+        pass
+
+    # --- 3) PIPELINE PARALLEL (PP) GROUP ALL-REDUCE ---
+    #pp_group = get_pp_group()
+    #pp_world_size = pp_group.world_size
+    #logger.info(f"[Rank={rank}, Local Rank={local_rank}] PP world size={pp_world_size}")
+    #if pp_world_size > 1:
+    #    dummy_pp = torch.tensor([3.0], device="hpu")
+    #    logger.info(f"[Rank={rank}, Local Rank={local_rank}] PP dummy before all_reduce: {dummy_pp}")
+    #    pp_group.all_reduce(dummy_pp)
+    #    logger.info(f"[Rank={rank}, Local Rank={local_rank}] PP dummy after all_reduce: PLACEHOLDER 1")
+    #    torch.distributed.barrier()
+    #    logger.info(f"[Rank={rank}, Local Rank={local_rank}] PP dummy after all_reduce: PLACEHOLDER 2")
+    #    logger.info(f"[Rank={rank}, Local Rank={local_rank}] PP dummy after all_reduce: {dummy_pp}")
+    #    pp_group.barrier()
+    #    logger.info(f"[Rank={rank}, Local Rank={local_rank}] Completed PP all_reduce + barrier: {dummy_pp.item()}")
+    #    assert dummy_pp.item() == 3 * pp_world_size, f"[Rank={rank}, Local Rank={local_rank}] PP all-reduce failed: {dummy_pp.item()} != {pp_world_size}"
+    #else:
+    #    logger.info(f"[Rank={rank}, Local Rank={local_rank}] Skipping PP all_reduce (size=1)")
+
+    #Dlogger.info(f"[Rank={rank}, Local Rank={local_rank}] All group all-reduce tests are done!\n")
+
+def test_all_gather_across_groups(rank, local_rank, world_size):
+    logger.info(f"[Rank={rank}, Local Rank={local_rank}] ==== Distributed Test Info ====")
+    
+    # Basic checks to ensure the distributed environment is set up correctly
+    assert torch.distributed.is_initialized(), f"[Rank={rank}, Local Rank={local_rank}] Distributed environment is not initialized"
+    _rank = torch.distributed.get_rank()
+    assert _rank == rank, f"[Rank={rank}, Local Rank={local_rank}] Rank mismatch: {rank} != {_rank}"
+    _world_size = torch.distributed.get_world_size()
+    assert _world_size == world_size, f"[Rank={rank}, Local Rank={local_rank}] World size mismatch: {world_size} != {_world_size}"
+    visible_modules = os.environ.get("HABANA_VISIBLE_MODULES", "Not set")
+    logger.info(f"[Rank={rank}, Local Rank={local_rank}] HABANA_VISIBLE_MODULES: {visible_modules}")
+    try:
+        current = torch.hpu.current_device()
+        logger.info(f"[Rank={rank}, Local Rank={local_rank}] Current HPU device (as reported): {current}")
+    except Exception as e:
+        logger.info(f"[Rank={rank}, Local Rank={local_rank}] Error getting current HPU device: {e}")
+
+    # --- 1) WORLD GROUP ALL-REDUCE ---
+    #logger.info(f"[Rank={rank}, Local Rank={local_rank}] Starting WORLD all-reduce test")
+    #dummy_world = torch.tensor([1.0], device="hpu")
+    #logger.info(f"[Rank={rank}, Local Rank={local_rank}] WORLD dummy before all_gather: {dummy_world}")
+    #torch.distributed.all_gather(dummy_world)  # blocking call, but doesn't force code alignment
+    #logger.info(f"[Rank={rank}, Local Rank={local_rank}] WORLD dummy after all_gather: {dummy_world}")
+    #torch.distributed.barrier()  # Now ensure all ranks hit this barrier
+    #logger.info(f"[Rank={rank}, Local Rank={local_rank}] Completed WORLD all_gather + barrier: {dummy_world.item()}")
+    #assert dummy_world.item() == world_size, f"[Rank={rank}, Local Rank={local_rank}] World all-reduce failed: {dummy_world.item()} != {world_size}"
+
+    # --- 2) TENSOR PARALLEL (TP) GROUP ALL-REDUCE ---
+    tp_group = get_tp_group()
+    tp_world_size = tp_group.world_size  # number of ranks in the TP group
+    logger.info(f"[Rank={rank}, Local Rank={local_rank}] TP world size={tp_world_size}")
+    if tp_world_size > 1:
+        dummy_tp_list = [torch.zeros(1, device="hpu") for _ in range(tp_world_size)]
+        logger.info(f"[Rank={rank}, Local Rank={local_rank}] TP dummy list before all_gather: {dummy_tp_list}")
+        dummy_tp = torch.tensor([local_rank], device="hpu")
+        logger.info(f"[Rank={rank}, Local Rank={local_rank}] TP dummy before all_gather: {dummy_tp}")
+        tp_group.all_gather(dummy_tp_list, dummy_tp)
+        logger.info(f"[Rank={rank}, Local Rank={local_rank}] TP dummy list after all_gather: {dummy_tp_list}")
+        # Some versions of vLLM provide a `barrier()` method on the group
+        # If not, you can do: torch.distributed.barrier(group=tp_group.device_group)
+        tp_group.barrier()
+        logger.info(f"[Rank={rank}, Local Rank={local_rank}] Completed TP all_gather + barrier: {[tp_ten.item() for tp_ten in dummy_tp_list]}")
+        #assert dummy_tp.item() == 2 * tp_world_size, f"[Rank={rank}, Local Rank={local_rank}] TP all-reduce failed: {dummy_tp.item()} != {tp_world_size}"
+    else:
+        logger.info(f"[Rank={rank}, Local Rank={local_rank}] Skipping TP all_gather (size=1)")
+
+    # --- 3) PIPELINE PARALLEL (PP) GROUP ALL-REDUCE ---
+    #pp_group = get_pp_group()
+    #pp_world_size = pp_group.world_size
+    #logger.info(f"[Rank={rank}, Local Rank={local_rank}] PP world size={pp_world_size}")
+    #if pp_world_size > 1:
+    #    dummy_pp = torch.tensor([3.0], device="hpu")
+    #    logger.info(f"[Rank={rank}, Local Rank={local_rank}] PP dummy before all_gather: {dummy_pp}")
+    #    pp_group.all_gather(dummy_pp)
+    #    logger.info(f"[Rank={rank}, Local Rank={local_rank}] PP dummy after all_gather: PLACEHOLDER 1")
+    #    torch.distributed.barrier()
+    #    logger.info(f"[Rank={rank}, Local Rank={local_rank}] PP dummy after all_gather: PLACEHOLDER 2")
+    #    logger.info(f"[Rank={rank}, Local Rank={local_rank}] PP dummy after all_gather: {dummy_pp}")
+    #    pp_group.barrier()
+    #    logger.info(f"[Rank={rank}, Local Rank={local_rank}] Completed PP all_gather + barrier: {dummy_pp.item()}")
+    #    assert dummy_pp.item() == 3 * pp_world_size, f"[Rank={rank}, Local Rank={local_rank}] PP all-reduce failed: {dummy_pp.item()} != {pp_world_size}"
+    #else:
+    #    logger.info(f"[Rank={rank}, Local Rank={local_rank}] Skipping PP all_gather (size=1)")
+
+    logger.info(f"[Rank={rank}, Local Rank={local_rank}] All group all-reduce tests are done!\n")
+ 
 def raise_if_cache_size_invalid(num_gpu_blocks, block_size,
                                 max_model_len) -> None:
     if num_gpu_blocks <= 0:

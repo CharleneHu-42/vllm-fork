@@ -309,7 +309,7 @@ class GroupCoordinator:
         with torch.cuda.stream(stream), maybe_ca_context:
             yield graph_capture_context
 
-    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+    def all_reduce(self, input_: torch.Tensor, op=None) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
         all-reduce operation.
@@ -348,7 +348,10 @@ class GroupCoordinator:
 
         if self.hpu_communicator is not None and \
             not self.hpu_communicator.disabled:
-            return self.hpu_communicator.all_reduce(input_)
+            if op is None:
+                return self.hpu_communicator.all_reduce(input_)
+            else:
+                return self.hpu_communicator.all_reduce(input_, op=op)
 
         if self.xpu_communicator is not None and \
                 not self.xpu_communicator.disabled:
@@ -379,22 +382,30 @@ class GroupCoordinator:
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
+        #Dlogger.info(f"GroupCoordinator.all_gather.loc_1: {self.rank_in_group}")
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
+        #Dlogger.info(f"GroupCoordinator.all_gather.loc_2: {self.rank_in_group}")
         assert -input_.dim() <= dim < input_.dim(), (
             f"Invalid dim ({dim}) for input tensor with shape {input_.size()}")
+        #Dlogger.info(f"GroupCoordinator.all_gather.loc_3: {self.rank_in_group}")
 
         # For TPUs, use TPU communicator.
         tpu_comm = self.tpu_communicator
         if tpu_comm is not None and not tpu_comm.disabled:
             return tpu_comm.all_gather(input_, dim)
+        #Dlogger.info(f"GroupCoordinator.all_gather.loc_4: {self.rank_in_group}")
 
         # For HPUs, use HPU communicator.
         hpu_comm = self.hpu_communicator
         if hpu_comm is not None and not hpu_comm.disabled:
-            return hpu_comm.all_gather(input_, dim)
-
+            #Dlogger.info(f"GroupCoordinator.all_gather.loc_5: {self.rank_in_group}")
+            #Dlogger.info(f"Running an all_gather in GroupCoordinator.all_gather 1: {self.rank_in_group}, {input_.shape}, {torch.max(input_)}")
+            output = hpu_comm.all_gather(input_, dim)
+            #Dlogger.info(f"Finished an all_gather in GroupCoordinator.all_gather 1: {self.rank_in_group}, {input_.shape}, {torch.max(input_)}")
+            return output
+        #Dlogger.info(f"GroupCoordinator.all_gather.loc_6: {self.rank_in_group}")
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
@@ -408,11 +419,14 @@ class GroupCoordinator:
                                     dtype=input_.dtype,
                                     device=input_.device)
         # All-gather.
+        #Dlogger.info(f"Running an all_gather in GroupCoordinator.all_gather 2: {self.rank_in_group}")
         torch.distributed.all_gather_into_tensor(output_tensor,
                                                  input_,
                                                  group=self.device_group)
+        #Dlogger.info(f"Finished an all_gather in GroupCoordinator.all_gather 2: {self.rank_in_group}")
         # Reshape
         output_tensor = output_tensor.reshape((world_size, ) + input_size)
+        #Dlogger.info(f"No all_gather hang in GroupCoordinator.all_gather 2: {self.rank_in_group}")
         output_tensor = output_tensor.movedim(0, dim)
         output_tensor = output_tensor.reshape(input_size[:dim] +
                                               (world_size *
@@ -527,21 +541,25 @@ class GroupCoordinator:
 
         # Serialize object to tensor and get the size as well
         object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
+        #Dlogger.info(f"Finished an torch.frombuffer[{dst}] in GroupCoordinator.send_object: {self.rank_in_group}")
 
         size_tensor = torch.tensor([object_tensor.numel()],
                                    dtype=torch.long,
                                    device="cpu")
+        #Dlogger.info(f"No torch.frombuffer[{dst}] hang in GroupCoordinator.send_object: {self.rank_in_group}")
 
         # Send object size
 
         torch.distributed.send(size_tensor,
                                dst=self.ranks[dst],
                                group=self.cpu_group)
+        #Dlogger.info(f"Finished an send[size, {dst}, {self.cpu_group}] in GroupCoordinator.send_object: {self.rank_in_group}")
 
         # Send object
         torch.distributed.send(object_tensor,
                                dst=self.ranks[dst],
                                group=self.cpu_group)
+        #Dlogger.info(f"Finished an send[object, {dst}, {self.cpu_group}] in GroupCoordinator.send_object: {self.rank_in_group}")
 
         return None
 
@@ -556,26 +574,31 @@ class GroupCoordinator:
         )
 
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
+        #Dlogger.info(f"Finished an torch.empty[{src}, {self.ranks[src]}, {self.cpu_group}] in GroupCoordinator.recv_object: {self.rank_in_group}, {size_tensor.shape}, {torch.max(size_tensor)}")
 
         # Receive object size
         rank_size = torch.distributed.recv(size_tensor,
                                            src=self.ranks[src],
                                            group=self.cpu_group)
+        #Dlogger.info(f"Finished an torch.distributed.recv[size, {src}, {self.ranks[src]}, {self.cpu_group}] in GroupCoordinator.recv_object: {self.rank_in_group}, {size_tensor.shape}, {torch.max(size_tensor)}, {rank_size}")
 
         # Tensor to receive serialized objects into.
         object_tensor = torch.empty(  # type: ignore[call-overload]
             size_tensor.item(),  # type: ignore[arg-type]
             dtype=torch.uint8,
             device="cpu")
+        #Dlogger.info(f"Finished an torch.empty[{src}, {self.ranks[src]}, {self.cpu_group}] in GroupCoordinator.recv_object: {self.rank_in_group}, {object_tensor.shape}, {torch.max(object_tensor)}")
 
         rank_object = torch.distributed.recv(object_tensor,
                                              src=self.ranks[src],
                                              group=self.cpu_group)
+        #Dlogger.info(f"Finished an torch.distributed.recv[object, {src}, {self.ranks[src]}, {self.cpu_group}] in GroupCoordinator.recv_object: {self.rank_in_group}, {object_tensor.shape}, {torch.max(object_tensor)}, {rank_object}")
 
         assert rank_object == rank_size, (
             "Received object sender rank does not match the size sender rank.")
 
         obj = pickle.loads(object_tensor.numpy().tobytes())
+        #Dlogger.info(f"Finished an pickle.loads[{src}, {self.ranks[src]}, {self.cpu_group}] in GroupCoordinator.recv_object: {self.rank_in_group}, {obj}")
 
         return obj
 
@@ -697,7 +720,9 @@ class GroupCoordinator:
         # `metadata_list` lives in CPU memory.
         # `send_object_list` has serialization & deserialization,
         # all happening on CPU. Therefore, we can use the CPU group.
+        #Dlogger.info(f"Running an send_object in GroupCoordinator.send_tensor_dict: {self.rank_in_group}")
         self.send_object(metadata_list, dst=dst)
+        #Dlogger.info(f"Finished an send_object in GroupCoordinator.send_tensor_dict: {self.rank_in_group}")
         for tensor in tensor_list:
             if tensor.numel() == 0:
                 # Skip sending empty tensors.
@@ -744,26 +769,35 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
 
+        #Dlogger.info(f"Running an recv_object[{src}] in GroupCoordinator.recv_tensor_dict: {self.rank_in_group}")
         recv_metadata_list = self.recv_object(src=src)
+        #Dlogger.info(f"Finished an recv_object[{src}] in GroupCoordinator.recv_tensor_dict: {self.rank_in_group}")
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
+            #Dlogger.info(f"GroupCoordinator.recv_tensor_dict.loc_1: {self.rank_in_group}, {all_gather_group.rank_in_group}, {key}")
             if isinstance(value, TensorMetadata):
+                #Dlogger.info(f"GroupCoordinator.recv_tensor_dict.loc_1: {self.rank_in_group}, {all_gather_group.rank_in_group}, {key}, {value}")
                 tensor = torch.empty(value.size,
                                      dtype=value.dtype,
                                      device=value.device)
+                #Dlogger.info(f"GroupCoordinator.recv_tensor_dict.loc_2: {self.rank_in_group}, {all_gather_group.rank_in_group}, {key}, {tensor.shape}, {torch.max(tensor)}")
                 if tensor.numel() == 0:
                     # Skip broadcasting empty tensors.
                     tensor_dict[key] = tensor
                     continue
+                #Dlogger.info(f"GroupCoordinator.recv_tensor_dict.loc_3: {self.rank_in_group}, {all_gather_group.rank_in_group}, {key}, {tensor.shape}, {torch.max(tensor)}")
 
                 # send-allgather: send only a slice, then do allgather.
                 use_all_gather = (all_gather_group is not None
                                   and tensor.numel() % all_gather_size == 0)
+                #Dlogger.info(f"GroupCoordinator.recv_tensor_dict.loc_4: {self.rank_in_group}, {all_gather_group.rank_in_group}, {key}, {use_all_gather}")
 
                 if use_all_gather:
                     orig_shape = tensor.shape
+                    #Dlogger.info(f"GroupCoordinator.recv_tensor_dict.loc_5: {self.rank_in_group}, {all_gather_group.rank_in_group}, {key}, {orig_shape}")
                     tensor = tensor.reshape(all_gather_size,
                                             -1)[all_gather_rank]
+                    #Dlogger.info(f"GroupCoordinator.recv_tensor_dict.loc_6: {self.rank_in_group}, {all_gather_group.rank_in_group}, {key}, {all_gather_size}, {tensor.shape}")
 
                 if tensor.is_cpu:
                     # use metadata_group for CPU tensors
@@ -775,11 +809,15 @@ class GroupCoordinator:
                     torch.distributed.recv(tensor,
                                            src=self.ranks[src],
                                            group=group)
+                #Dlogger.info(f"GroupCoordinator.recv_tensor_dict.loc_7: {self.rank_in_group}, {all_gather_group.rank_in_group}, {key}")
                 if use_all_gather:
                     # do the allgather
+                    #Dlogger.info(f"Running an all_gather in GroupCoordinator.recv_tensor_dict: {self.rank_in_group}, {all_gather_group.rank_in_group}")
                     tensor = all_gather_group.all_gather(  # type: ignore
                         tensor, dim=0)
+                    #Dlogger.info(f"Finished an all_gather in GroupCoordinator.recv_tensor_dict: {self.rank_in_group}, {all_gather_group.rank_in_group}")
                     tensor = tensor.reshape(orig_shape)
+                    #Dlogger.info(f"No all_gather hang in GroupCoordinator.recv_tensor_dict: {self.rank_in_group}, {all_gather_group.rank_in_group}")
 
                 tensor_dict[key] = tensor
             else:
@@ -950,6 +988,14 @@ def set_custom_all_reduce(enable: bool):
     global _ENABLE_CUSTOM_ALL_REDUCE
     _ENABLE_CUSTOM_ALL_REDUCE = enable
 
+def apply_hpu_workarounds():
+    import os
+    def update_wa_env_var(key, value):
+        if key not in os.environ.keys():
+            os.environ[key] = value
+
+    update_wa_env_var("PT_HPU_LAZY_ACC_PAR_MODE", "0")
+    update_wa_env_var("PT_HPU_ENABLE_REFINE_DYNAMIC_SHAPES", "0")
 
 def init_distributed_environment(
     world_size: int = -1,
@@ -958,7 +1004,8 @@ def init_distributed_environment(
     local_rank: int = -1,
     backend: str = "nccl",
 ):
-    logger.debug(
+    #Dapply_hpu_workarounds()
+    logger.info(
         "world_size=%d rank=%d local_rank=%d "
         "distributed_init_method=%s backend=%s", world_size, rank, local_rank,
         distributed_init_method, backend)
@@ -967,6 +1014,8 @@ def init_distributed_environment(
             "distributed_init_method must be provided when initializing "
             "distributed environment")
         # this backend is used for WORLD
+        #Dimport habana_frameworks.torch.distributed.hccl as hccl
+        #Dhccl.initialize_distributed_hpu(world_size=world_size, rank=rank, local_rank=local_rank)
         torch.distributed.init_process_group(
             backend=backend,
             init_method=distributed_init_method,
@@ -1092,17 +1141,30 @@ def ensure_model_parallel_initialized(
     """
     backend = backend or torch.distributed.get_backend(
         get_world_group().device_group)
+    #Dlogger.info(f"\n\nbackend: {backend}\n\n")
+    
     if not model_parallel_is_initialized():
         initialize_model_parallel(tensor_model_parallel_size,
                                   pipeline_model_parallel_size, backend)
+        pp_world_size = get_pp_group().world_size
+        pp_rank, pp_local_rank, pp_rank_in_group = get_pp_group().rank, get_pp_group().local_rank, get_pp_group().rank_in_group
+        tp_world_size = get_tp_group().world_size
+        tp_rank, tp_local_rank, tp_rank_in_group = get_tp_group().rank, get_tp_group().local_rank, get_tp_group().rank_in_group
+        #Dlogger.info(f"\n\npp_world_size: {pp_world_size}, pp_rank: {pp_rank}, pp_local_rank: {pp_local_rank}, pp_rank_in_group: {pp_rank_in_group}\n\n")
+        #Dlogger.info(f"\n\ntp_world_size: {tp_world_size}, tp_rank: {tp_rank}, tp_local_rank: {tp_local_rank}, tp_rank_in_group: {tp_rank_in_group}\n\n")
         return
+    pp_world_size = get_pp_group().world_size
+    pp_rank, pp_local_rank, pp_rank_in_group = get_pp_group().rank, get_pp_group().local_rank, get_pp_group().rank_in_group
+    tp_world_size = get_tp_group().world_size
+    tp_rank, tp_local_rank, tp_rank_in_group = get_tp_group().rank, get_tp_group().local_rank, get_tp_group().rank_in_group
+    #Dlogger.info(f"\n\npp_world_size: {pp_world_size}, pp_rank: {pp_rank}, pp_local_rank: {pp_local_rank}, pp_rank_in_group: {pp_rank_in_group}\n\n")
+    #Dlogger.info(f"\n\ntp_world_size: {tp_world_size}, tp_rank: {tp_rank}, tp_local_rank: {tp_local_rank}, tp_rank_in_group: {tp_rank_in_group}\n\n")
 
     assert (
         get_tensor_model_parallel_world_size() == tensor_model_parallel_size
     ), ("tensor parallel group already initialized, but of unexpected size: "
         f"{get_tensor_model_parallel_world_size()=} vs. "
         f"{tensor_model_parallel_size=}")
-    pp_world_size = get_pp_group().world_size
     assert (pp_world_size == pipeline_model_parallel_size), (
         "pipeline parallel group already initialized, but of unexpected size: "
         f"{pp_world_size=} vs. "

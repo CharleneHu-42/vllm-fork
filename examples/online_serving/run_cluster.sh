@@ -41,9 +41,15 @@ fi
 docker run \
     --entrypoint /bin/bash \
     --network host \
+    --ipc=host \
     --name node \
     --shm-size 10.24g \
-    --gpus all \
+    --runtime=habana \
+    -e HABANA_VISIBLE_DEVICES=all \
+    -e GLOO_SOCKET_IFNAME="ens7f0np0" \
+    -e NCCL_SOCKET_IFNAME="ens7f0np0" \
+    -e HCCL_SOCKET_IFNAME="ens7f0np0" \
     -v "${PATH_TO_HF_HOME}:/root/.cache/huggingface" \
+    -v "/nfs_home_tvoas/logs/pp_test:/workspace/logs" \
     "${ADDITIONAL_ARGS[@]}" \
     "${DOCKER_IMAGE}" -c "${RAY_START_CMD}"

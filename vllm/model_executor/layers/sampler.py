@@ -33,13 +33,18 @@ if envs.VLLM_USE_FLASHINFER_SAMPLER and find_spec("flashinfer"):
     # yapf: enable
 else:
     flashinfer_top_k_top_p_sampling = None
+from vllm.logger import init_logger
 
+logger = init_logger(__name__)
 
 def get_sampler() -> torch.nn.Module:
+    #Dlogger.info(f"[STACK_TRACE] sampler.get_sampler.start")
     if envs.VLLM_USE_V1:
         # Lazy import: the v1 package isn't distributed
         from vllm.v1.sample.sampler import Sampler as V1Sampler
+        #Dlogger.info(f"[STACK_TRACE] sampler.get_sampler.end_1")
         return V1Sampler()
+    #Dlogger.info(f"[STACK_TRACE] sampler.get_sampler.end_2")
     return Sampler()
 
 

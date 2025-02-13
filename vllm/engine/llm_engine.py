@@ -215,7 +215,7 @@ class LLMEngine:
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         use_cached_outputs: bool = False,
     ) -> None:
-
+        #Dlogger.info(f"[STACK_TRACE] LLMEngine.__init__.start")
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -404,6 +404,7 @@ class LLMEngine:
             ))
 
         self.seq_id_to_seq_group: Dict[str, SequenceGroupBase] = {}
+        #Dlogger.info(f"[STACK_TRACE] LLMEngine.__init__.end")
 
     def _initialize_kv_caches(self) -> None:
         """Initialize the KV cache in the worker(s).
@@ -411,6 +412,7 @@ class LLMEngine:
         The workers will determine the number of blocks in both the GPU cache
         and the swap CPU cache.
         """
+        #Dlogger.info(f"[STACK_TRACE] LLMEngine._initialize_kv_caches.start")
         start = time.time()
         num_gpu_blocks, num_cpu_blocks = (
             self.model_executor.determine_num_available_blocks())
@@ -430,6 +432,7 @@ class LLMEngine:
         elapsed = time.time() - start
         logger.info(("init engine (profile, create kv cache, "
                      "warmup model) took %.2f seconds"), elapsed)
+        #Dlogger.info(f"[STACK_TRACE] LLMEngine._initialize_kv_caches.end")
 
     @classmethod
     def _get_executor_cls(cls,
@@ -1305,6 +1308,7 @@ class LLMEngine:
             >>>     if not (engine.has_unfinished_requests() or example_inputs):
             >>>         break
         """
+        #Dlogger.info(f"[STACK_TRACE] LLMEngine.step.start")
         if self.parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError(
                 "Pipeline parallelism is only supported through AsyncLLMEngine "
@@ -1441,6 +1445,7 @@ class LLMEngine:
                 self.do_tracing(scheduler_outputs)
         else:
             # Multi-step case
+            #Dlogger.info(f"[STACK_TRACE] LLMEngine.step.end_1")
             return ctx.request_outputs
 
         if not self.has_unfinished_requests():
@@ -1457,6 +1462,7 @@ class LLMEngine:
             logger.debug("Stopping remote worker execution loop.")
             self.model_executor.stop_remote_worker_execution_loop()
 
+        #Dlogger.info(f"[STACK_TRACE] LLMEngine.step.end_2")
         return ctx.request_outputs
 
     def _has_remaining_steps(

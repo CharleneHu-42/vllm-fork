@@ -33,6 +33,7 @@ from vllm.attention import Attention, AttentionMetadata
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
@@ -57,6 +58,8 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     maybe_prefix)
 
 is_hpu = current_platform.is_hpu()
+
+logger = init_logger(__name__)
 
 
 class LlamaMLP(nn.Module):
@@ -204,11 +207,13 @@ class LlamaAttention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        #Dlogger.info(f"[STACK_TRACE] LlamaAttention.forward.start")
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         output, _ = self.o_proj(attn_output)
+        #Dlogger.info(f"[STACK_TRACE] LlamaAttention.forward.end")
         return output
 
 
@@ -239,6 +244,8 @@ class LlamaDecoderLayer(nn.Module):
         # support internlm/internlm3-8b with qkv_bias
         if hasattr(config, 'qkv_bias'):
             attention_bias = config.qkv_bias
+
+        self.debug_prefix = prefix
 
         self.self_attn = LlamaAttention(
             config=config,
@@ -276,6 +283,7 @@ class LlamaDecoderLayer(nn.Module):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        #Dlogger.info(f"[STACK_TRACE] LlamaDecoderLayer.forward.start: {self.debug_prefix}")
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -292,6 +300,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        #Dlogger.info(f"[STACK_TRACE] LlamaDecoderLayer.forward.end: {self.debug_prefix}")
         return hidden_states, residual
 
 
@@ -356,16 +365,20 @@ class LlamaModel(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        #Dlogger.info(f"[STACK_TRACE] LlamaModel.forward.start")
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
+                #Dlogger.info(f"[STACK_TRACE] Path 1! {inputs_embeds.shape}")
                 hidden_states = inputs_embeds
             else:
+                #Dlogger.info(f"[STACK_TRACE] Path 2! {None if input_ids is None else input_ids.shape}")
                 hidden_states = self.get_input_embeddings(input_ids)
             residual = None
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+            #Dlogger.info(f"[STACK_TRACE] Path 3! {hidden_states.shape}, {torch.max(hidden_states)}")
 
         if is_hpu:
             import habana_frameworks.torch as htorch
@@ -381,8 +394,10 @@ class LlamaModel(nn.Module):
                 "hidden_states": hidden_states,
                 "residual": residual
             })
-
+        #Dlogger.info(f"[STACK_TRACE] LlamaModel.forward.loc_1: {hidden_states}")
+        #Dlogger.info(f"[STACK_TRACE] LlamaModel.forward.loc_2: {residual}")
         hidden_states, _ = self.norm(hidden_states, residual)
+        #Dlogger.info(f"[STACK_TRACE] LlamaModel.forward.end")
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str,
@@ -551,9 +566,11 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        #Dlogger.info(f"[STACK_TRACE] LlamaForCausalLM.forward.start")
         model_output = self.model(input_ids, positions, kv_caches,
                                   attn_metadata, intermediate_tensors,
                                   inputs_embeds)
+        #Dlogger.info(f"[STACK_TRACE] LlamaForCausalLM.forward.end")
         return model_output
 
     def compute_logits(
@@ -567,7 +584,9 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
     def sample(self, logits: torch.Tensor,
                sampling_metadata: SamplingMetadata) -> Optional[SamplerOutput]:
+        #Dlogger.info(f"[STACK_TRACE] LlamaForCausalLM.sample.start")
         next_tokens = self.sampler(logits, sampling_metadata)
+        #Dlogger.info(f"[STACK_TRACE] LlamaForCausalLM.sample.start")
         return next_tokens
 
     def load_weights(self, weights: Iterable[Tuple[str,

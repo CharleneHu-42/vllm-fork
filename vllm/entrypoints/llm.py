@@ -420,6 +420,7 @@ class LLM:
             considered legacy and may be deprecated in the future. You should
             instead pass them via the ``inputs`` parameter.
         """
+        #Dlogger.info(f"[STACK_TRACE] LLM.generate.start")
         runner_type = self.llm_engine.model_config.runner_type
         if runner_type != "generate":
             messages = [
@@ -467,6 +468,7 @@ class LLM:
             priority=priority)
 
         outputs = self._run_engine(use_tqdm=use_tqdm)
+        #Dlogger.info(f"[STACK_TRACE] LLM.generate.end")
         return self.engine_class.validate_outputs(outputs, RequestOutput)
 
     def collective_rpc(self,
@@ -880,6 +882,7 @@ class LLM:
             considered legacy and may be deprecated in the future. You should
             instead pass them via the ``inputs`` parameter.
         """
+        #Dlogger.info(f"[STACK_TRACE] LLM.encode.start")
         runner_type = self.llm_engine.model_config.runner_type
         if runner_type != "pooling":
             messages = ["LLM.encode() is only supported for pooling models."]
@@ -916,6 +919,7 @@ class LLM:
         )
 
         outputs = self._run_engine(use_tqdm=use_tqdm)
+        #Dlogger.info(f"[STACK_TRACE] LLM.encode.end")
         return self.engine_class.validate_outputs(outputs,
                                                   PoolingRequestOutput)
 
@@ -1136,6 +1140,7 @@ class LLM:
             A list of ``ScoringRequestOutput`` objects containing the
             generated scores in the same order as the input prompts.
         """
+        #Dlogger.info(f"[STACK_TRACE] LLM.score.start")
         runner_type = self.llm_engine.model_config.runner_type
         if runner_type != "pooling":
             messages = ["LLM.score() is only supported for pooling models."]
@@ -1171,6 +1176,7 @@ class LLM:
                 elif "prompt" in prompt:
                     prompt = cast(TextPrompt, prompt)["prompt"]
             assert type(prompt) is str
+            #Dlogger.info(f"[STACK_TRACE] LLM.score.end_1")
             return prompt
 
         if isinstance(text_1, (str, dict)):
@@ -1191,14 +1197,15 @@ class LLM:
             raise ValueError("At least one text_pair element must be given")
 
         if self.llm_engine.model_config.is_cross_encoder:
-            return self._cross_encoding_score(tokenizer, input_text_1,
-                                              input_text_2,
-                                              truncate_prompt_tokens, use_tqdm,
-                                              lora_request,
-                                              prompt_adapter_request)
+            encoding_score = self._cross_encoding_score(tokenizer, input_text_1,
+                input_text_2,
+                truncate_prompt_tokens, use_tqdm,
+                lora_request,
+                prompt_adapter_request)
+            #Dlogger.info(f"[STACK_TRACE] LLM.score.end_2")
+            return encoding_score
         else:
-
-            return self._embedding_score(
+            embedding_score = self._embedding_score(
                 tokenizer,
                 input_text_1,  # type: ignore[arg-type]
                 input_text_2,  # type: ignore[arg-type]
@@ -1206,6 +1213,8 @@ class LLM:
                 use_tqdm,
                 lora_request,
                 prompt_adapter_request)
+            #Dlogger.info(f"[STACK_TRACE] LLM.score.end_3")
+            return embedding_score
 
     def start_profile(self) -> None:
         self.llm_engine.start_profile()
@@ -1378,6 +1387,7 @@ class LLM:
     def _run_engine(
             self, *, use_tqdm: bool
     ) -> List[Union[RequestOutput, PoolingRequestOutput]]:
+        #Dlogger.info(f"[STACK_TRACE] LLM._run_engine.start")
         # Initialize tqdm.
         if use_tqdm:
             num_requests = self.llm_engine.get_num_unfinished_requests()
@@ -1422,4 +1432,5 @@ class LLM:
         # Sort the outputs by request ID.
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
+        #Dlogger.info(f"[STACK_TRACE] LLM._run_engine.end")
         return sorted(outputs, key=lambda x: int(x.request_id))

@@ -122,8 +122,11 @@ class CustomAllreduce:
             torch.tensor([0], dtype=torch.int, device="cpu")
             for _ in range(world_size)
         ]
+        #Dlogger.info(f"Running an all_gather in CustomAllreduce.__init__: {rank}")
         dist.all_gather(gather_list, tensor, group=self.group)
+        #Dlogger.info(f"Finished an all_gather in CustomAllreduce.__init__: {rank}")
         physical_device_ids = [t.item() for t in gather_list]
+        #Dlogger.info(f"No all_gather hang in CustomAllreduce.__init__: {rank}")
 
         # test nvlink first, this will filter out most of the cases
         # where custom allreduce is not supported
