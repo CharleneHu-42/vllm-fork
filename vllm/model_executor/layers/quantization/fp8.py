@@ -1057,7 +1057,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             orig_M_w2 = layer.orig_M_w2.data
             orig_N_w2 = layer.orig_N_w2.data
 
-        if self.quant_config.activation_scheme == "dynamic" and not self.block_quant:
+        if self.quant_config.activation_scheme == "dynamic":
             x_fp8, x_scale = dynamic_quant(x)
         else:
             x_scale = layer.w13_input_scale.data

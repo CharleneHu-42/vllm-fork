@@ -1145,6 +1145,10 @@ class IntermediateTensors:
     def __repr__(self) -> str:
         return f"IntermediateTensors(tensors={self.tensors})"
 
+    def __hash__(self) -> int:
+        shapes = tuple(sorted(tensor.shape for tensor in self.tensors.values())) 
+        return hash(shapes) 
+
 
 class PoolerOutput(
         msgspec.Struct,
