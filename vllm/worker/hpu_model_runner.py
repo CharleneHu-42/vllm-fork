@@ -30,7 +30,7 @@ from vllm_hpu_extension.profiler import (HabanaHighLevelProfiler,
 
 from vllm.attention import AttentionMetadata, get_attn_backend
 from vllm.config import DeviceConfig, VllmConfig
-from vllm.distributed import broadcast_tensor_dict
+from vllm.distributed import broadcast_tensor_dict, get_pp_group
 from vllm.distributed.parallel_state import get_world_group
 from vllm.forward_context import set_forward_context
 from vllm.inputs import INPUT_REGISTRY, InputRegistry
@@ -412,9 +412,11 @@ class HpuModelAdapter:
         with set_forward_context(kwargs['attn_metadata'], self.vllm_config,
                                  virtual_engine):
             hidden_states = self.model(*args, **kwargs)
-            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-            hidden_states = hidden_states.index_select(0,
-                                                       selected_token_indices)
+            if get_pp_group().is_last_rank:
+                hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+                if selected_token_indices is not None:
+                    hidden_states = hidden_states.index_select(
+                        0, selected_token_indices)
         return hidden_states
 
     def compute_logits(self, *args, **kwargs):
@@ -422,6 +424,9 @@ class HpuModelAdapter:
 
     def sample(self, *args, **kwargs):
         return self.model.sample(*args, **kwargs)
+
+    def make_empty_intermediate_tensors(self, *args, **kwargs):
+        return self.model.make_empty_intermediate_tensors(*args, **kwargs)
 
     def generate_proposals(self, *args, **kwargs):
         return self.model.generate_proposals(*args, **kwargs)
@@ -679,6 +684,15 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         # For delayed sampling
         self.cached_step_inputs: List[
             ModelInputForHPUWithSamplingMetadata] = []
+
+        # PP intermediate tensors
+        self.intermediate_tensors: IntermediateTensors = None
+
+    def get_intermediate_tensors(self) -> IntermediateTensors:
+        return self.intermediate_tensors
+
+    def set_intermediate_tensors(self, intermediate_tensors: IntermediateTensors) -> None:
+        self.intermediate_tensors = intermediate_tensors
 
     def _set_gc_threshold(self) -> None:
         # Read https://docs.python.org/3/library/gc.html#gc.set_threshold
@@ -1605,9 +1619,13 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
     def profile_run(self) -> None:
         num_layers = self.model_config.get_num_layers(self.parallel_config)
         kv_caches = [None] * num_layers
+        bind_kv_caches = [
+            [None] * num_layers
+            for _ in range(self.parallel_config.pipeline_parallel_size)
+        ]
         bind_kv_cache(
             self.vllm_config.compilation_config.static_forward_context,
-            [kv_caches])
+            bind_kv_caches)
         _, max_seq_len = self.bucketing_ctx.get_max_prompt_shape()
         max_batch_size = min(self.max_num_seqs,
                              self.max_num_batched_tokens // max_seq_len)
@@ -1692,8 +1710,19 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                     broadcast_tensor_dict(src=0)
             is_single_step = \
                 self.vllm_config.scheduler_config.num_scheduler_steps == 1
-            if is_prompt or is_single_step:
-                self.execute_model(inputs, kv_caches, warmup_mode=True)
+            if is_single_step:
+                intermediate_tensors = None
+                if self.parallel_config.pipeline_parallel_size > 1:
+                    intermediate_tensors = \
+                        self.model.make_empty_intermediate_tensors(
+                            batch_size=batch_size,
+                            context_size=seq_len if is_prompt else 1,
+                            dtype=self.model_config.dtype,
+                            device=self.device)
+                self.execute_model(inputs,
+                                   kv_caches,
+                                   intermediate_tensors=intermediate_tensors,
+                                   warmup_mode=True)
             else:  # decode with multi-step
                 inputs = dataclasses.replace(inputs,
                                              is_first_multi_step=True,
@@ -2121,6 +2150,14 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
             assert model_input.attn_metadata is not None
             is_prompt = model_input.attn_metadata.is_prompt
 
+            # Init PP Intermediate Tensors
+            if self.parallel_config.pipeline_parallel_size > 1:
+                self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
+                    batch_size=model_input.batch_size_padded,
+                    context_size=model_input.input_tokens.size(1) if is_prompt else 1,
+                    dtype=self.model_config.dtype,
+                    device=self.device)
+
         return dataclasses.replace(model_input,
                                    sampling_metadata=sampling_metadata,
                                    is_prompt=is_prompt,
@@ -2388,6 +2425,9 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                     LoraMask.setLoraMask(
                         lora_logits_mask.index_select(
                             0, sampling_metadata.selected_token_indices))
+                    
+                if not get_pp_group().is_last_rank:
+                    return hidden_states
 
                 # Compute the logits.
                 with self.profiler.record_event(

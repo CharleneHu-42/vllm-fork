@@ -213,7 +213,11 @@ class LLMEngine:
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         use_cached_outputs: bool = False,
     ) -> None:
-
+        try:
+            from vllm.worker.hpu_worker import apply_hpu_dataclass_monkey_patch
+            apply_hpu_dataclass_monkey_patch()
+        except:
+            pass
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config

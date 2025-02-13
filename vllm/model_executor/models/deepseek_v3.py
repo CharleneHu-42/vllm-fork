@@ -29,6 +29,7 @@ from transformers import PretrainedConfig
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.compilation.decorators import support_torch_compile
 from vllm.distributed import (get_pp_group,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
@@ -590,7 +591,7 @@ class DeepseekV3DecoderLayer(nn.Module):
 
 
 # TODO(simon): check whether we support torch compile for Deepseek V3
-# @support_torch_compile
+@support_torch_compile
 class DeepseekV3Model(nn.Module):
 
     fall_back_to_pt_during_load = False
@@ -645,6 +646,8 @@ class DeepseekV3Model(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        if get_pp_group().world_size > 1:
+            assert intermediate_tensors is not None
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -652,7 +655,6 @@ class DeepseekV3Model(nn.Module):
                 hidden_states = self.get_input_embeddings(input_ids)
             residual = None
         else:
-            assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
@@ -668,10 +670,10 @@ class DeepseekV3Model(nn.Module):
                 htorch.core.mark_step()
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors({
-                "hidden_states": hidden_states,
-                "residual": residual
-            })
+            intermediate_tensors["hidden_states"].copy_(hidden_states)
+            intermediate_tensors["residual"].copy_(residual)
+            return intermediate_tensors
+
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -728,20 +730,6 @@ class DeepseekV3ForCausalLM(nn.Module, SupportsPP):
     ) -> Optional[SamplerOutput]:
         next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
-
-    def make_empty_intermediate_tensors(
-            self, batch_size: int, dtype: torch.dtype,
-            device: torch.device) -> IntermediateTensors:
-        return IntermediateTensors({
-            "hidden_states":
-            torch.zeros((batch_size, self.config.hidden_size),
-                        dtype=dtype,
-                        device=device),
-            "residual":
-            torch.zeros((batch_size, self.config.hidden_size),
-                        dtype=dtype,
-                        device=device),
-        })
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:

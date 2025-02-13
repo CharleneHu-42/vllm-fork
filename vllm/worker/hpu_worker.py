@@ -9,7 +9,7 @@ import json
 import os
 import queue
 import time
-from typing import List, Optional, Set, Tuple, Type
+from typing import Any, Dict, List, Optional, Set, Tuple, Type
 
 import habana_frameworks.torch as htorch  # noqa:F401
 import torch
@@ -18,7 +18,7 @@ from vllm_hpu_extension.profiler import HabanaMemoryProfiler, format_bytes
 
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
-from vllm.distributed import (ensure_model_parallel_initialized,
+from vllm.distributed import (ensure_model_parallel_initialized, get_pp_group,
                               init_distributed_environment)
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -36,6 +36,83 @@ from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
 
 logger = init_logger(__name__)
 
+def apply_hpu_dataclass_monkey_patch() -> None:
+    # FIXME(Tanner): This is a workaround for HPU due to lacking support
+    #                for dataclass objects in graph.py on pytorch bridge.
+    #                This should be removed if using CD 1.21.0-398 or later.
+    import habana_frameworks.torch.hpu.graphs as hgraph
+    from dataclasses import is_dataclass, fields
+    import collections
+    from habana_frameworks.torch import _hpu_C
+    _original_input_hash = hgraph.input_hash
+    _original_copy_to = hgraph.copy_to
+    _original_get_user_input_tensor_list = hgraph.get_user_input_tensor_list
+    _original_extract_tensors = hgraph.extract_tensors
+    def patched_input_hash(obj):
+        if isinstance(obj, dict):
+            return patched_input_hash(tuple(obj.items()))
+        elif isinstance(obj, list) or (isinstance(obj, tuple) and not isinstance(obj, torch.Size)):
+            # torch.Size is specialization of tuple, so we don't want extra recursion.
+            return hash((tuple(patched_input_hash(el) for el in obj), torch.hpu.is_autocast_hpu_enabled()))
+        elif torch.is_tensor(obj):
+            return hash(tuple([obj.shape, _hpu_C.get_view_hash(obj), torch.hpu.is_autocast_hpu_enabled()]))
+        elif isinstance(obj, collections.UserDict):
+            return hash(tuple((k, tuple(patched_input_hash(v_el) for v_el in v)) for k, v in obj.items()))
+        elif is_dataclass(obj):
+            return hash(tuple((field.name, patched_input_hash(getattr(obj, field.name))) for field in fields(obj)))
+        else:
+            return hash((obj, torch.hpu.is_autocast_hpu_enabled()))
+    hgraph.input_hash = patched_input_hash
+
+    def patched_copy_to(dst, src):
+        assert type(dst) is type(src)
+        if isinstance(dst, dict):
+            for (dk, dv), (sk, sv) in zip(dst.items(), src.items()):
+                assert dk == sk
+                patched_copy_to(dv, sv)
+        elif isinstance(dst, list) or (isinstance(dst, tuple) and not isinstance(dst, torch.Size)):
+            for d, s in zip(dst, src):
+                patched_copy_to(d, s)
+        elif is_dataclass(dst):
+            for field in fields(dst):
+                patched_copy_to(getattr(dst, field.name), getattr(src, field.name))
+        elif torch.is_tensor(dst):
+            dst.copy_(src, non_blocking=True)
+    hgraph.copy_to = patched_copy_to
+
+    def patched_get_user_input_tensor_list(inputs, tlist):
+        if isinstance(inputs, dict):
+            for inp in inputs.items():
+                tlist = patched_get_user_input_tensor_list(inp, tlist)
+        elif isinstance(inputs, list) or isinstance(inputs, tuple):
+            for inp in inputs:
+                tlist = patched_get_user_input_tensor_list(inp, tlist)
+        elif is_dataclass(inputs):
+            for field in fields(inputs):
+                tlist = patched_get_user_input_tensor_list(getattr(inputs, field.name), tlist)
+        elif torch.is_tensor(inputs):
+            tlist = tlist + (inputs,)
+        return tlist
+    hgraph.get_user_input_tensor_list = patched_get_user_input_tensor_list
+
+    def patched_extract_tensors(data):
+        tensors = []
+        if isinstance(data, torch.Tensor):
+            tensors.append(data)
+        elif isinstance(data, (list, tuple)):
+            for item in data:
+                tensors.extend(patched_extract_tensors(item))
+        elif isinstance(data, dict):
+            for value in data.values():
+                tensors.extend(patched_extract_tensors(value))
+        elif is_dataclass(data):
+            for field in fields(data):
+                tensors.extend(patched_extract_tensors(getattr(data, field.name)))
+        elif hasattr(data, "__dict__"):
+            for value in data.__dict__.values():
+                tensors.extend(patched_extract_tensors(value))
+        return tensors
+    hgraph.extract_tensors = patched_extract_tensors
 
 class HPUWorker(LocalOrDistributedWorkerBase):
     """A worker class that executes (a partition of) the model on a HPU.
@@ -53,15 +130,21 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         distributed_init_method: str,
         is_driver_worker: bool = False,
         model_runner_cls: Optional[Type[HPUModelRunner]] = None,
+        vllm_envs: Optional[Dict[str, str]] = None,
     ) -> None:
+        apply_hpu_dataclass_monkey_patch()
+        if vllm_envs is not None:
+            for envv in vllm_envs:
+                os.environ[envv] = vllm_envs[envv]
         WorkerBase.__init__(self, vllm_config=vllm_config)
         self.parallel_config.rank = rank
         self.local_rank = local_rank
         self.rank = rank
         self.distributed_init_method = distributed_init_method
         self.is_driver_worker = is_driver_worker
-        if self.is_driver_worker:
-            assert self.rank == 0, "The driver worker must have rank 0."
+        if self.parallel_config and self.is_driver_worker:
+            assert self.rank % self.parallel_config.tensor_parallel_size == 0, \
+            "The driver worker must have TP rank 0."
 
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
@@ -511,7 +594,11 @@ def init_worker_distributed_environment(
 
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
-
+    
+    if parallel_config.pipeline_parallel_size > 1:
+        # torch-ccl xpu need a collective API warm up
+        # before calling send/recv API
+        get_pp_group().all_reduce(torch.zeros(1).to('hpu'))
     if torch.distributed.is_initialized():
         torch_world_size = torch.distributed.get_world_size()
         if torch_world_size != parallel_config.world_size:
