@@ -255,6 +255,11 @@ class DistributedExecutorBase(ExecutorBase):
     def __init__(self, *args, **kwargs):
         # This is non-None when the execute model loop is running
         # in the parallel workers. It's a coroutine in the AsyncLLMEngine case.
+        try:
+            from vllm.worker.hpu_worker import apply_hpu_dataclass_monkey_patch
+            apply_hpu_dataclass_monkey_patch()
+        except:
+            pass
         self.parallel_worker_tasks: Optional[Union[Any, Awaitable[Any]]] = None
 
         super().__init__(*args, **kwargs)

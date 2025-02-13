@@ -154,6 +154,7 @@ class GroupCoordinator:
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
+    force_cpu: bool
 
     def __init__(
         self,
@@ -167,6 +168,7 @@ class GroupCoordinator:
         use_xpu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
+        force_cpu: bool = False,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -250,6 +252,7 @@ class GroupCoordinator:
         if use_message_queue_broadcaster and self.world_size > 1:
             self.mq_broadcaster = MessageQueue.create_from_process_group(
                 self.cpu_group, 1 << 22, 6)
+        self.force_cpu: bool = force_cpu
 
     @property
     def first_rank(self):
@@ -703,6 +706,12 @@ class GroupCoordinator:
                 torch.distributed.send(tensor,
                                        dst=self.ranks[dst],
                                        group=metadata_group)
+            elif self.force_cpu:
+                # use metadata_group for CPU tensors
+                tensor = tensor.to('cpu')
+                torch.distributed.send(tensor,
+                                    dst=self.ranks[dst],
+                                    group=metadata_group)
             else:
                 # use group for GPU tensors
                 torch.distributed.send(tensor,
@@ -760,6 +769,13 @@ class GroupCoordinator:
                     torch.distributed.recv(tensor,
                                            src=self.ranks[src],
                                            group=metadata_group)
+                elif self.force_cpu:
+                    # use metadata_group for CPU tensors
+                    tensor = tensor.to('cpu')
+                    torch.distributed.recv(tensor,
+                                        src=self.ranks[src],
+                                        group=metadata_group)
+                    tensor = tensor.to(device=value.device)
                 else:
                     # use group for GPU tensors
                     torch.distributed.recv(tensor,
@@ -775,6 +791,116 @@ class GroupCoordinator:
             else:
                 tensor_dict[key] = value
         return tensor_dict
+
+    def send_intermediate_tensors(
+        self,
+        tensor_dict: Dict[str, torch.Tensor],
+        dst: Optional[int] = None,
+        all_gather_group: Optional["GroupCoordinator"] = None,
+    ):
+        """Send the input tensor dictionary.
+        NOTE: `dst` is the local rank of the source rank.
+        """
+        # Bypass the function if we are using only 1 GPU.
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return tensor_dict
+
+        all_gather_size = (1 if all_gather_group is None else
+                           all_gather_group.world_size)
+        all_gather_rank = (0 if all_gather_group is None else
+                           all_gather_group.rank_in_group)
+
+        group = self.device_group
+        metadata_group = self.cpu_group
+
+        if dst is None:
+            dst = (self.rank_in_group + 1) % self.world_size
+        assert dst < self.world_size, f"Invalid dst rank ({dst})"
+
+        for tensor in tensor_dict.values():
+            if tensor.numel() == 0:
+                # Skip sending empty tensors.
+                continue
+
+            # send-allgather: send only a slice, then do allgather.
+            if (all_gather_group is not None
+                    and tensor.numel() % all_gather_size == 0):
+                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+
+            if tensor.is_cpu:
+                # use metadata_group for CPU tensors
+                torch.distributed.send(tensor,
+                                       dst=self.ranks[dst],
+                                       group=metadata_group)
+            elif self.force_cpu:
+                # use metadata_group for CPU tensors
+                orig_device = tensor.device
+                tensor = tensor.to('cpu')
+                torch.distributed.send(tensor,
+                                    dst=self.ranks[dst],
+                                    group=metadata_group)
+                tensor = tensor.to(orig_device)
+            else:
+                # use group for GPU tensors
+                torch.distributed.send(tensor,
+                                       dst=self.ranks[dst],
+                                       group=group)
+
+    def recv_intermediate_tensors(
+        self,
+        tensor_dict: Dict[str, torch.Tensor],
+        src: Optional[int] = None,
+        all_gather_group: Optional["GroupCoordinator"] = None,
+    ):
+        """Recv the input tensor dictionary.
+        NOTE: `src` is the local rank of the source rank.
+        """
+        # Bypass the function if we are using only 1 GPU.
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return None
+
+        all_gather_size = (1 if all_gather_group is None else
+                           all_gather_group.world_size)
+        all_gather_rank = (0 if all_gather_group is None else
+                           all_gather_group.rank_in_group)
+
+        group = self.device_group
+        metadata_group = self.cpu_group
+
+        if src is None:
+            src = (self.rank_in_group - 1) % self.world_size
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        for key, tensor in tensor_dict.items():
+            # send-allgather: send only a slice, then do allgather.
+            use_all_gather = (all_gather_group is not None
+                              and tensor.numel() % all_gather_size == 0)
+
+            if use_all_gather:
+                tensor = tensor.reshape(all_gather_size,
+                                        -1)[all_gather_rank]
+
+            if tensor.is_cpu:
+                # use metadata_group for CPU tensors
+                torch.distributed.recv(tensor,
+                                        src=self.ranks[src],
+                                        group=metadata_group)
+            elif self.force_cpu:
+                # use metadata_group for CPU tensors
+                tensor = tensor.to('cpu')
+                torch.distributed.recv(tensor,
+                                    src=self.ranks[src],
+                                    group=metadata_group)
+                tensor = tensor.to(orig_device)
+            else:
+                # use group for GPU tensors
+                torch.distributed.recv(tensor,
+                                        src=self.ranks[src],
+                                        group=group)
+            if use_all_gather:
+                # do the allgather
+                torch.distributed.all_gather_into_tensor(  # type: ignore
+                    tensor_dict[key].view(all_gather_size, -1), tensor, group=all_gather_group.device_group)
 
     def barrier(self):
         """Barrier synchronization among the group.
@@ -875,6 +1001,8 @@ def init_model_parallel_group(
         use_xpu_communicator=True,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
+        force_cpu=envs.VLLM_PP_USE_CPU_COMS \
+            if group_name.lower() == "pp" else False,
     )
 
 
