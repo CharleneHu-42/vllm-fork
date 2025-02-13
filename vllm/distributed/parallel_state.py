@@ -20,6 +20,7 @@ If you only need to use the distributed environment without model/pipeline
  steps.
 """
 import contextlib
+import os
 import gc
 import pickle
 import weakref
@@ -29,6 +30,7 @@ from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple,
                     Union)
+from vllm_hpu_extension.profiler import HabanaHighLevelProfiler
 from unittest.mock import patch
 
 import torch
@@ -40,6 +42,7 @@ import vllm.envs as envs
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.logger import init_logger
 from vllm.utils import direct_register_custom_op, supports_custom_op
+from contextlib import nullcontext
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -154,6 +157,7 @@ class GroupCoordinator:
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
+    force_cpu: bool
 
     def __init__(
         self,
@@ -167,8 +171,11 @@ class GroupCoordinator:
         use_xpu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
+        force_cpu: bool = False,
+        profiler: Optional[HabanaHighLevelProfiler] = None,
     ):
         group_name = group_name or "anonymous"
+        self.group_name = group_name
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
 
@@ -176,6 +183,7 @@ class GroupCoordinator:
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
+        self.profiler = profiler
 
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
@@ -250,6 +258,7 @@ class GroupCoordinator:
         if use_message_queue_broadcaster and self.world_size > 1:
             self.mq_broadcaster = MessageQueue.create_from_process_group(
                 self.cpu_group, 1 << 22, 6)
+        self.force_cpu: bool = force_cpu
 
     @property
     def first_rank(self):
@@ -307,7 +316,7 @@ class GroupCoordinator:
         with torch.cuda.stream(stream), maybe_ca_context:
             yield graph_capture_context
 
-    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+    def all_reduce(self, input_: torch.Tensor, op=None) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
         all-reduce operation.
@@ -338,7 +347,10 @@ class GroupCoordinator:
 
         if self.hpu_communicator is not None and \
             not self.hpu_communicator.disabled:
-            return self.hpu_communicator.all_reduce(input_)
+            if op is None:
+                return self.hpu_communicator.all_reduce(input_)
+            else:
+                return self.hpu_communicator.all_reduce(input_, op=op)
 
         if self.xpu_communicator is not None and \
                 not self.xpu_communicator.disabled:
@@ -703,6 +715,12 @@ class GroupCoordinator:
                 torch.distributed.send(tensor,
                                        dst=self.ranks[dst],
                                        group=metadata_group)
+            elif self.force_cpu:
+                # use metadata_group for CPU tensors
+                tensor = tensor.to('cpu')
+                torch.distributed.send(tensor,
+                                    dst=self.ranks[dst],
+                                    group=metadata_group)
             else:
                 # use group for GPU tensors
                 torch.distributed.send(tensor,
@@ -760,6 +778,13 @@ class GroupCoordinator:
                     torch.distributed.recv(tensor,
                                            src=self.ranks[src],
                                            group=metadata_group)
+                elif self.force_cpu:
+                    # use metadata_group for CPU tensors
+                    tensor = tensor.to('cpu')
+                    torch.distributed.recv(tensor,
+                                        src=self.ranks[src],
+                                        group=metadata_group)
+                    tensor = tensor.to(device=value.device)
                 else:
                     # use group for GPU tensors
                     torch.distributed.recv(tensor,
@@ -859,6 +884,7 @@ def init_model_parallel_group(
     use_custom_allreduce: Optional[bool] = None,
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
+    profiler: Optional[HabanaHighLevelProfiler] = None
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -875,6 +901,8 @@ def init_model_parallel_group(
         use_xpu_communicator=True,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
+        force_cpu=False, #True if group_name.lower() == "pp" else False,
+        profiler=profiler,
     )
 
 
@@ -984,7 +1012,9 @@ def init_distributed_environment(
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
+    expert_model_parallel_size: int = 1,
     backend: Optional[str] = None,
+    profiler: Optional[HabanaHighLevelProfiler] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1024,6 +1054,12 @@ def initialize_model_parallel(
     # Build the tensor model-parallel groups.
     num_tensor_model_parallel_groups: int = (world_size //
                                              tensor_model_parallel_size)
+    os.environ['VLLM_EP_SIZE'] = str(expert_model_parallel_size)
+    if expert_model_parallel_size > 0:
+        os.environ['PT_HPU_WEIGHT_SHARING'] = "0"
+        os.environ['VLLM_MLA_DISABLE_REQUANTIZATION'] = "1" 
+
+
     global _TP
     assert _TP is None, ("tensor model parallel group is already initialized")
     group_ranks = []
@@ -1038,7 +1074,8 @@ def initialize_model_parallel(
                                     get_world_group().local_rank,
                                     backend,
                                     use_message_queue_broadcaster=True,
-                                    group_name="tp")
+                                    group_name="tp",
+                                    profiler=profiler)
 
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = (world_size //
@@ -1055,7 +1092,8 @@ def initialize_model_parallel(
                                     get_world_group().local_rank,
                                     backend,
                                     use_custom_allreduce=False,
-                                    group_name="pp")
+                                    group_name="pp",
+                                    profiler=profiler)
 
 
 def ensure_kv_transfer_initialized(vllm_config: "VllmConfig") -> None:
@@ -1081,7 +1119,9 @@ def ensure_kv_transfer_initialized(vllm_config: "VllmConfig") -> None:
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
+    expert_model_parallel_size: int,
     backend: Optional[str] = None,
+    profiler: Optional[HabanaHighLevelProfiler] = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -1091,7 +1131,8 @@ def ensure_model_parallel_initialized(
         get_world_group().device_group)
     if not model_parallel_is_initialized():
         initialize_model_parallel(tensor_model_parallel_size,
-                                  pipeline_model_parallel_size, backend)
+                                  pipeline_model_parallel_size,
+                                  expert_model_parallel_size, backend, profiler=profiler)
         return
 
     assert (
