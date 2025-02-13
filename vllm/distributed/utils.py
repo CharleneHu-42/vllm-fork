@@ -87,7 +87,51 @@ def get_pp_indices(num_hidden_layers: int, pp_rank: int,
 
         if pp_rank == pp_size - 1:
             end_layer = num_hidden_layers
-
+    if pp_size == 2:
+        if pp_rank == 0:
+            start_layer += 0
+            end_layer += 2
+        elif pp_rank == 1:
+            start_layer += 2
+            end_layer += 0
+    elif pp_size == 4:
+        if pp_rank == 0:
+            start_layer += 0
+            end_layer += 2
+        elif pp_rank == 1:
+            start_layer += 2
+            end_layer += 2
+        elif pp_rank == 2:
+            start_layer += 2
+            end_layer += 1
+        elif pp_rank == 3:
+            start_layer += 1
+            end_layer += 0
+    elif pp_size == 8:
+        if pp_rank == 0:
+            start_layer += 0
+            end_layer += 0
+        elif pp_rank == 1:
+            start_layer += 0
+            end_layer += 0
+        elif pp_rank == 2:
+            start_layer += 0
+            end_layer += 0
+        elif pp_rank == 3:
+            start_layer += 0
+            end_layer += 0
+        elif pp_rank == 4:
+            start_layer += 0
+            end_layer += 0
+        elif pp_rank == 5:
+            start_layer += 0
+            end_layer += 0
+        elif pp_rank == 6:
+            start_layer += 0
+            end_layer += 0
+        elif pp_rank == 7:
+            start_layer += 0
+            end_layer += 0
     return (start_layer, end_layer)
 
 
