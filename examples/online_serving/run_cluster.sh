@@ -47,8 +47,8 @@ docker run \
     --shm-size 10.24g \
     --runtime=habana \
     -e HABANA_VISIBLE_DEVICES=all \
-    -e GLOO_SOCKET_IFNAME="ens7f0np0" \
-    -e HCCL_SOCKET_IFNAME="ens7f0np0" \
+    -e GLOO_SOCKET_IFNAME="enx6c1ff7012f65" \
+    -e HCCL_SOCKET_IFNAME="enx6c1ff7012f65" \
     -v "${PATH_TO_HF_HOME}:/root/.cache/huggingface" \
     -v "/tmp/logs:/workspace/logs" \
     "${ADDITIONAL_ARGS[@]}" \

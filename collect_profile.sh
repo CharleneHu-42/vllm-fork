@@ -2,7 +2,7 @@
 set -ex
 
 
-model_path=/root/.cache/huggingface/deepseek-ai/DeepSeek-R1-G2
+model_path=/root/.cache/huggingface/DeepSeek-R1-BF16-w8afp8-static-no-ste-G2
 cache_path=$model_path/.hpu_cache
 
 # set to 0 to improve the available memory 
