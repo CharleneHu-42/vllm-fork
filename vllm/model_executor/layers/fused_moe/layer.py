@@ -26,6 +26,7 @@ if current_platform.is_tpu():
     from .moe_torch_iterative import fused_moe as fused_moe_pallas
 else:
     fused_moe_pallas = None  # type: ignore
+from vllm.distributed import get_pp_group, get_tp_group
 logger = init_logger(__name__)
 
 
@@ -707,6 +708,7 @@ class FusedMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor,
                 router_logits: torch.Tensor):
         assert self.quant_method is not None
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_FusedMoE_forward_start')
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
@@ -726,6 +728,7 @@ class FusedMoE(torch.nn.Module):
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states)
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_FusedMoE_forward_end')
 
         return final_hidden_states
 

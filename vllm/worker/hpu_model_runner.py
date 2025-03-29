@@ -30,7 +30,7 @@ from vllm_hpu_extension.profiler import (HabanaHighLevelProfiler,
 
 from vllm.attention import AttentionMetadata, get_attn_backend
 from vllm.config import DeviceConfig, VllmConfig
-from vllm.distributed import broadcast_tensor_dict, get_pp_group
+from vllm.distributed import broadcast_tensor_dict, get_pp_group, get_tp_group
 from vllm.distributed.parallel_state import get_world_group
 from vllm.forward_context import set_forward_context
 from vllm.inputs import INPUT_REGISTRY, InputRegistry
@@ -713,99 +713,108 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
 
     def load_model(self) -> None:
         import habana_frameworks.torch.core as htcore
-        if self.model_config.quantization == 'inc' or \
-           self.model_config.quantization == 'fp8':
-            htcore.hpu_set_env()
-        with HabanaMemoryProfiler() as m:
-            with HabanaMemoryProfiler() as m_getmodel:
-                self.model = get_model(vllm_config=self.vllm_config)
-            msg = ("Pre-loading model weights on "
-                   f"{next(self.model.parameters()).device} "
-                   f"took {m_getmodel.get_summary_string()}")
+        with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_load_model_start'):
+            if self.model_config.quantization == 'inc' or \
+            self.model_config.quantization == 'fp8':
+                with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_load_model_hpu_set_env'):
+                    htcore.hpu_set_env()
+            with HabanaMemoryProfiler() as m:
+                with HabanaMemoryProfiler() as m_getmodel:
+                    with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_load_model_get_model'):
+                        self.model = get_model(vllm_config=self.vllm_config)
+                msg = ("Pre-loading model weights on "
+                    f"{next(self.model.parameters()).device} "
+                    f"took {m_getmodel.get_summary_string()}")
+                logger.info(msg)
+
+                if self.lora_config:
+                    with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_load_model_lora_manager'):
+                        assert hasattr(self.model, "supported_lora_modules"
+                                    ) and self.model.supported_lora_modules, (
+                                        "Model does not support LoRA")
+                        assert hasattr(self.model, "embedding_modules"
+                                    ), "Model does not have embedding_modules"
+                        assert hasattr(
+                            self.model, "embedding_padding_modules"
+                        ), "Model does not have embedding_padding_modules"
+                        assert not self.lora_config.bias_enabled, \
+                            "Bias support in LoRA is not enabled in HPU yet."
+                        assert not self.lora_config.fully_sharded_loras, \
+                            "Fully sharded LoRAs is not enabled in HPU yet."
+                        if supports_multimodal(self.model):
+                            logger.warning(
+                                "Regarding multimodal models, vLLM currently "
+                                "only supports adding LoRA to language model.")
+                        # It's necessary to distinguish between the
+                        # max_position_embeddings of VLMs and LLMs.
+                        if hasattr(self.model.config, "max_position_embeddings"):
+                            max_pos_embeddings = (
+                                self.model.config.max_position_embeddings)
+                        else:
+                            max_pos_embeddings = (
+                                self.model.config.text_config.max_position_embeddings)
+
+                        self.lora_manager = LRUCacheWorkerLoRAManager(
+                            self.scheduler_config.max_num_seqs,
+                            self.scheduler_config.max_num_batched_tokens,
+                            self.vocab_size,
+                            self.lora_config,
+                            self.device,
+                            self.model.embedding_modules,
+                            self.model.embedding_padding_modules,
+                            max_position_embeddings=max_pos_embeddings,
+                        )
+                        self.model = self.lora_manager.create_lora_manager(self.model)
+
+                if self.model_config.quantization == 'inc':
+                    with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_load_model_inc'):
+                        logger.info("Preparing model with INC..")
+                        with HabanaMemoryProfiler() as m_inc:
+                            from neural_compressor.torch.quantization import (
+                                FP8Config, convert, prepare)
+                            config = FP8Config.from_json_file(
+                                os.getenv("QUANT_CONFIG", ""))
+                            if config.measure:
+                                self.model = prepare(self.model, config)
+                            elif config.quantize:
+                                self.model = convert(self.model, config)
+                            htcore.hpu_initialize(self.model,
+                                                mark_only_scales_as_const=True)
+                        self.inc_initialized_successfully = True
+                        logger.info("Preparing model with INC took %s",
+                                    m_inc.get_summary_string())
+                elif not is_fake_hpu():
+                    with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_load_model_hpu'):
+                        self.model = self.model.to("hpu")
+                        htcore.mark_step()
+                with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_load_model_modify_model_layers'):
+                    hidden_layer_markstep_interval = int(
+                        os.getenv('VLLM_CONFIG_HIDDEN_LAYERS', '1'))
+                    model_config = getattr(self.model, "config", None)
+                    modify_model_layers(
+                        self.model,
+                        get_target_layer_suffix_list(
+                            model_config.
+                            model_type if model_config is not None else None),
+                        hidden_layer_markstep_interval)
+                with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_load_model_path_to_rope'):
+                    path_to_rope = get_path_to_rope(self.model)
+                with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_load_model_sync'):
+                    torch.hpu.synchronize()
+
+                with HabanaMemoryProfiler() as m_wrap:
+                    with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_load_model_wrap'):
+                        self.model = self._maybe_wrap_in_hpu_graph(
+                            self.model,
+                            vllm_config=self.vllm_config,
+                            layer_names=path_to_rope)
+                msg = f"Wrapping in HPU Graph took {m_wrap.get_summary_string()}"
+                logger.info(msg)
+
+            self.model_memory_usage = m.consumed_device_memory
+            msg = f"Loading model weights took in total {m.get_summary_string()}"
             logger.info(msg)
-
-            if self.lora_config:
-                assert hasattr(self.model, "supported_lora_modules"
-                               ) and self.model.supported_lora_modules, (
-                                   "Model does not support LoRA")
-                assert hasattr(self.model, "embedding_modules"
-                               ), "Model does not have embedding_modules"
-                assert hasattr(
-                    self.model, "embedding_padding_modules"
-                ), "Model does not have embedding_padding_modules"
-                assert not self.lora_config.bias_enabled, \
-                    "Bias support in LoRA is not enabled in HPU yet."
-                assert not self.lora_config.fully_sharded_loras, \
-                    "Fully sharded LoRAs is not enabled in HPU yet."
-                if supports_multimodal(self.model):
-                    logger.warning(
-                        "Regarding multimodal models, vLLM currently "
-                        "only supports adding LoRA to language model.")
-                # It's necessary to distinguish between the
-                # max_position_embeddings of VLMs and LLMs.
-                if hasattr(self.model.config, "max_position_embeddings"):
-                    max_pos_embeddings = (
-                        self.model.config.max_position_embeddings)
-                else:
-                    max_pos_embeddings = (
-                        self.model.config.text_config.max_position_embeddings)
-
-                self.lora_manager = LRUCacheWorkerLoRAManager(
-                    self.scheduler_config.max_num_seqs,
-                    self.scheduler_config.max_num_batched_tokens,
-                    self.vocab_size,
-                    self.lora_config,
-                    self.device,
-                    self.model.embedding_modules,
-                    self.model.embedding_padding_modules,
-                    max_position_embeddings=max_pos_embeddings,
-                )
-                self.model = self.lora_manager.create_lora_manager(self.model)
-
-            if self.model_config.quantization == 'inc':
-                logger.info("Preparing model with INC..")
-                with HabanaMemoryProfiler() as m_inc:
-                    from neural_compressor.torch.quantization import (
-                        FP8Config, convert, prepare)
-                    config = FP8Config.from_json_file(
-                        os.getenv("QUANT_CONFIG", ""))
-                    if config.measure:
-                        self.model = prepare(self.model, config)
-                    elif config.quantize:
-                        self.model = convert(self.model, config)
-                    htcore.hpu_initialize(self.model,
-                                          mark_only_scales_as_const=True)
-                self.inc_initialized_successfully = True
-                logger.info("Preparing model with INC took %s",
-                            m_inc.get_summary_string())
-            elif not is_fake_hpu():
-                self.model = self.model.to("hpu")
-                htcore.mark_step()
-
-            hidden_layer_markstep_interval = int(
-                os.getenv('VLLM_CONFIG_HIDDEN_LAYERS', '1'))
-            model_config = getattr(self.model, "config", None)
-            modify_model_layers(
-                self.model,
-                get_target_layer_suffix_list(
-                    model_config.
-                    model_type if model_config is not None else None),
-                hidden_layer_markstep_interval)
-            path_to_rope = get_path_to_rope(self.model)
-            torch.hpu.synchronize()
-
-            with HabanaMemoryProfiler() as m_wrap:
-                self.model = self._maybe_wrap_in_hpu_graph(
-                    self.model,
-                    vllm_config=self.vllm_config,
-                    layer_names=path_to_rope)
-            msg = f"Wrapping in HPU Graph took {m_wrap.get_summary_string()}"
-            logger.info(msg)
-
-        self.model_memory_usage = m.consumed_device_memory
-        msg = f"Loading model weights took in total {m.get_summary_string()}"
-        logger.info(msg)
-        logger.info(f"")
+            logger.info(f"")
 
     def _add_dummy_seq(self, seq_group_metadata_list, is_prompt):
         real_batch_size = len(seq_group_metadata_list)

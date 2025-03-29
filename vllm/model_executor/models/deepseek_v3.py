@@ -53,11 +53,15 @@ from .interfaces import SupportsPP
 from .utils import (PPMissingLayer, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
+from vllm.distributed import get_pp_group, get_tp_group
+from vllm.logger import init_logger
 
 import habana_frameworks.torch as htorch
 
 from vllm.platforms import current_platform
 is_hpu = current_platform.is_hpu()
+
+logger = init_logger(__name__)
 
 class DeepseekV3MLP(nn.Module):
 
@@ -89,9 +93,11 @@ class DeepseekV3MLP(nn.Module):
 
 
     def forward(self, x):
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3MLP_forward_start')
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3MLP_forward_end')
         return x
 
 
@@ -159,24 +165,32 @@ class DeepseekV3MoE(nn.Module):
 
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3MoE_forward_start')
         batch_size, seq_len, hidden_dim = hidden_states.shape
         num_tokens = batch_size * seq_len
         hidden_states = hidden_states.view(-1, hidden_dim)
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3MoE_forward_step_1')
         router_logits, _ = self.gate(hidden_states)
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3MoE_forward_step_2')
         hidden_states = hidden_states.reshape(batch_size, seq_len, hidden_dim)
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3MoE_forward_step_3')
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             router_logits=router_logits) * self.routed_scaling_factor
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3MoE_forward_step_4')
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3MoE_forward_step_5')
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states)
-
-        return final_hidden_states.view(batch_size, seq_len, hidden_dim)
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3MoE_forward_step_6')
+        output_ = final_hidden_states.view(batch_size, seq_len, hidden_dim)
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3MoE_forward_end')
+        return output_
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -296,6 +310,7 @@ class DeepseekV3Attention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3Attention_forward_start')
         batch_size, seq_len = hidden_states.size(0), hidden_states.size(1)
         hidden_states = hidden_states.view(batch_size * seq_len, *hidden_states.shape[2:])
         positions = positions.view(-1)
@@ -353,6 +368,7 @@ class DeepseekV3Attention(nn.Module):
             self.qk_head_dim)[..., :self.v_head_dim].reshape(
                 batch_size, seq_len, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3Attention_forward_end')
         return output
 
 
@@ -487,6 +503,7 @@ class DeepseekV3MLAAttention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3MLAAttention_forward_start')
         if self.q_lora_rank is not None:
             ckq = self.q_a_proj(hidden_states)[0]
             hidden_states_or_q_c = self.q_a_layernorm(ckq)
@@ -495,8 +512,10 @@ class DeepseekV3MLAAttention(nn.Module):
         kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states)[0].split(
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
-        return self.mla_attn(hidden_states_or_q_c, kv_c_normed, k_pe, kv_cache,
+        output_ = self.mla_attn(hidden_states_or_q_c, kv_c_normed, k_pe, kv_cache,
                              attn_metadata)
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3MLAAttention_forward_end')
+        return output_
 
 
 class DeepseekV3DecoderLayer(nn.Module):
@@ -568,6 +587,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3DecoderLayer_forward_start')
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -586,6 +606,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3DecoderLayer_forward_end')
         return hidden_states, residual
 
 
@@ -645,6 +666,7 @@ class DeepseekV3Model(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3Model_forward_start')
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -668,12 +690,14 @@ class DeepseekV3Model(nn.Module):
                 htorch.core.mark_step()
 
         if not get_pp_group().is_last_rank:
+            logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3Model_forward_end_1')
             return IntermediateTensors({
                 "hidden_states": hidden_states,
                 "residual": residual
             })
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3Model_forward_end_2')
         return hidden_states
 
 
@@ -707,9 +731,11 @@ class DeepseekV3ForCausalLM(nn.Module, SupportsPP):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3ForCausalLM_forward_start')
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata, intermediate_tensors,
                                    inputs_embeds)
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_DeepseekV3ForCausalLM_forward_end')
         return hidden_states
 
     def compute_logits(

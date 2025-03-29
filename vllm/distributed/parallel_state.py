@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple,
                     Union)
+from vllm_hpu_extension.profiler import HabanaHighLevelProfiler
 from unittest.mock import patch
 
 import torch
@@ -41,6 +42,7 @@ import vllm.envs as envs
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.logger import init_logger
 from vllm.utils import direct_register_custom_op, supports_custom_op
+from contextlib import nullcontext
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -170,8 +172,10 @@ class GroupCoordinator:
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
         force_cpu: bool = False,
+        profiler: Optional[HabanaHighLevelProfiler] = None,
     ):
         group_name = group_name or "anonymous"
+        self.group_name = group_name
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
 
@@ -179,6 +183,7 @@ class GroupCoordinator:
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
+        self.profiler = profiler
 
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
@@ -292,24 +297,29 @@ class GroupCoordinator:
     @contextmanager
     def graph_capture(
             self, graph_capture_context: Optional[GraphCaptureContext] = None):
-        if graph_capture_context is None:
-            stream = torch.cuda.Stream()
-            graph_capture_context = GraphCaptureContext(stream)
-        else:
-            stream = graph_capture_context.stream
+        with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_graph_capture'):
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_graph_capture_start'):
+                dummy = None
+            if graph_capture_context is None:
+                stream = torch.cuda.Stream()
+                graph_capture_context = GraphCaptureContext(stream)
+            else:
+                stream = graph_capture_context.stream
 
-        ca_comm = self.ca_comm
-        maybe_ca_context = nullcontext(
-        ) if ca_comm is None else ca_comm.capture()
+            ca_comm = self.ca_comm
+            maybe_ca_context = nullcontext(
+            ) if ca_comm is None else ca_comm.capture()
 
-        # ensure all initialization operations complete before attempting to
-        # capture the graph on another stream
-        curr_stream = torch.cuda.current_stream()
-        if curr_stream != stream:
-            stream.wait_stream(curr_stream)
+            # ensure all initialization operations complete before attempting to
+            # capture the graph on another stream
+            curr_stream = torch.cuda.current_stream()
+            if curr_stream != stream:
+                stream.wait_stream(curr_stream)
 
-        with torch.cuda.stream(stream), maybe_ca_context:
-            yield graph_capture_context
+            with torch.cuda.stream(stream), maybe_ca_context:
+                yield graph_capture_context
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_graph_capture_end'):
+                dummy = None
 
     def all_reduce(self, input_: torch.Tensor, op=None) -> torch.Tensor:
         """
@@ -329,93 +339,132 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
+        
+        with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_all_reduce'):
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_all_reduce_start'):
+                dummy = None
+            if input_.is_cpu:
+                import intel_extension_for_pytorch as ipex
+                ipex.distributed.all_reduce(input_, group=self.device_group)
+                with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_all_reduce_end'):
+                    dummy = None
+                return input_
 
-        if input_.is_cpu:
-            import intel_extension_for_pytorch as ipex
-            ipex.distributed.all_reduce(input_, group=self.device_group)
-            return input_
+            if self.tpu_communicator is not None and \
+                not self.tpu_communicator.disabled:
+                # TPU handles Dynamo with its own logic.
+                output_ = self.tpu_communicator.all_reduce(input_)
+                with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_all_reduce_end'):
+                    dummy = None
+                return output_
 
-        if self.tpu_communicator is not None and \
-            not self.tpu_communicator.disabled:
-            # TPU handles Dynamo with its own logic.
-            return self.tpu_communicator.all_reduce(input_)
+            if self.hpu_communicator is not None and \
+                not self.hpu_communicator.disabled:
+                if op is None:
+                    output_ = self.hpu_communicator.all_reduce(input_)
+                    with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_all_reduce_end'):
+                        dummy = None
+                    return output_
+                else:
+                    output_ = self.hpu_communicator.all_reduce(input_, op=op)
+                    with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_all_reduce_end'):
+                        dummy = None
+                    return output_
 
-        if self.hpu_communicator is not None and \
-            not self.hpu_communicator.disabled:
-            if op is None:
-                return self.hpu_communicator.all_reduce(input_)
-            else:
-                return self.hpu_communicator.all_reduce(input_, op=op)
+            if self.xpu_communicator is not None and \
+                    not self.xpu_communicator.disabled:
+                output_ = self.xpu_communicator.all_reduce(input_)
+                with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_all_reduce_end'):
+                    dummy = None
+                return output_
 
-        if self.xpu_communicator is not None and \
-                not self.xpu_communicator.disabled:
-            return self.xpu_communicator.all_reduce(input_)
-
-        return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
+            output_ = torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_all_reduce_end'):
+                dummy = None
+            return output_
 
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         # always try custom allreduce first,
         # and then pynccl.
-        ca_comm = self.ca_comm
-        if ca_comm is not None and not ca_comm.disabled and \
-            ca_comm.should_custom_ar(input_):
-            out = ca_comm.custom_all_reduce(input_)
-            assert out is not None
+        with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_all_reduce_out_place'):
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_all_reduce_out_place_start'):
+                dummy = None
+            ca_comm = self.ca_comm
+            if ca_comm is not None and not ca_comm.disabled and \
+                ca_comm.should_custom_ar(input_):
+                out = ca_comm.custom_all_reduce(input_)
+                assert out is not None
+                with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_all_reduce_out_place_end'):
+                    dummy = None
+                return out
+            pynccl_comm = self.pynccl_comm
+            assert pynccl_comm is not None
+            out = pynccl_comm.all_reduce(input_)
+            if out is None:
+                # fall back to the default all-reduce using PyTorch.
+                # this usually happens during testing.
+                # when we run the model, allreduce only happens for the TP
+                # group, where we always have either custom allreduce or pynccl.
+                out = input_.clone()
+                torch.distributed.all_reduce(out, group=self.device_group)
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_all_reduce_out_place_end'):
+                dummy = None
             return out
-        pynccl_comm = self.pynccl_comm
-        assert pynccl_comm is not None
-        out = pynccl_comm.all_reduce(input_)
-        if out is None:
-            # fall back to the default all-reduce using PyTorch.
-            # this usually happens during testing.
-            # when we run the model, allreduce only happens for the TP
-            # group, where we always have either custom allreduce or pynccl.
-            out = input_.clone()
-            torch.distributed.all_reduce(out, group=self.device_group)
-        return out
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        assert -input_.dim() <= dim < input_.dim(), (
-            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}")
+        
+        with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_all_gather'):
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_all_gather_start'):
+                dummy = None
+            assert -input_.dim() <= dim < input_.dim(), (
+                f"Invalid dim ({dim}) for input tensor with shape {input_.size()}")
 
-        # For TPUs, use TPU communicator.
-        tpu_comm = self.tpu_communicator
-        if tpu_comm is not None and not tpu_comm.disabled:
-            return tpu_comm.all_gather(input_, dim)
+            # For TPUs, use TPU communicator.
+            tpu_comm = self.tpu_communicator
+            if tpu_comm is not None and not tpu_comm.disabled:
+                output_ = tpu_comm.all_gather(input_, dim)
+                with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_all_gather_end'):
+                    dummy = None
+                return output_
 
-        # For HPUs, use HPU communicator.
-        hpu_comm = self.hpu_communicator
-        if hpu_comm is not None and not hpu_comm.disabled:
-            return hpu_comm.all_gather(input_, dim)
+            # For HPUs, use HPU communicator.
+            hpu_comm = self.hpu_communicator
+            if hpu_comm is not None and not hpu_comm.disabled:
+                output_ = hpu_comm.all_gather(input_, dim)
+                with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_all_gather_end'):
+                    dummy = None
+                return output_
 
-        if dim < 0:
-            # Convert negative dim to positive.
-            dim += input_.dim()
-        input_size = input_.size()
-        # NOTE: we have to use concat-style all-gather here,
-        # stack-style all-gather has compatibility issues with
-        # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
-        output_size = (input_size[0] * world_size, ) + input_size[1:]
-        # Allocate output tensor.
-        output_tensor = torch.empty(output_size,
-                                    dtype=input_.dtype,
-                                    device=input_.device)
-        # All-gather.
-        torch.distributed.all_gather_into_tensor(output_tensor,
-                                                 input_,
-                                                 group=self.device_group)
-        # Reshape
-        output_tensor = output_tensor.reshape((world_size, ) + input_size)
-        output_tensor = output_tensor.movedim(0, dim)
-        output_tensor = output_tensor.reshape(input_size[:dim] +
-                                              (world_size *
-                                               input_size[dim], ) +
-                                              input_size[dim + 1:])
-        return output_tensor
+            if dim < 0:
+                # Convert negative dim to positive.
+                dim += input_.dim()
+            input_size = input_.size()
+            # NOTE: we have to use concat-style all-gather here,
+            # stack-style all-gather has compatibility issues with
+            # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
+            output_size = (input_size[0] * world_size, ) + input_size[1:]
+            # Allocate output tensor.
+            output_tensor = torch.empty(output_size,
+                                        dtype=input_.dtype,
+                                        device=input_.device)
+            # All-gather.
+            torch.distributed.all_gather_into_tensor(output_tensor,
+                                                    input_,
+                                                    group=self.device_group)
+            # Reshape
+            output_tensor = output_tensor.reshape((world_size, ) + input_size)
+            output_tensor = output_tensor.movedim(0, dim)
+            output_tensor = output_tensor.reshape(input_size[:dim] +
+                                                (world_size *
+                                                input_size[dim], ) +
+                                                input_size[dim + 1:])
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_all_gather_end'):
+                dummy = None
+            return output_tensor
 
     def gather(self,
                input_: torch.Tensor,
@@ -430,30 +479,38 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        assert -input_.dim() <= dim < input_.dim(), (
-            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}")
-        if dim < 0:
-            # Convert negative dim to positive.
-            dim += input_.dim()
-        if self.xpu_communicator is not None and \
-                not self.xpu_communicator.disabled:
-            return self.xpu_communicator.gather(input_, self.rank_in_group,
-                                                dst, dim)
-        # Allocate output tensor.
-        if self.rank_in_group == dst:
-            gather_list = [torch.empty_like(input_) for _ in range(world_size)]
-        else:
-            gather_list = None
-        # Gather.
-        torch.distributed.gather(input_,
-                                 gather_list,
-                                 dst=self.ranks[dst],
-                                 group=self.device_group)
-        if self.rank_in_group == dst:
-            output_tensor = torch.cat(gather_list, dim=dim)
-        else:
-            output_tensor = None
-        return output_tensor
+        with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_gather'):
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_gather_start'):
+                dummy = None
+            assert -input_.dim() <= dim < input_.dim(), (
+                f"Invalid dim ({dim}) for input tensor with shape {input_.size()}")
+            if dim < 0:
+                # Convert negative dim to positive.
+                dim += input_.dim()
+            if self.xpu_communicator is not None and \
+                    not self.xpu_communicator.disabled:
+                output_ = self.xpu_communicator.gather(input_, self.rank_in_group,
+                                                    dst, dim)
+                with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_gather_end'):
+                    dummy = None
+                return output_
+            # Allocate output tensor.
+            if self.rank_in_group == dst:
+                gather_list = [torch.empty_like(input_) for _ in range(world_size)]
+            else:
+                gather_list = None
+            # Gather.
+            torch.distributed.gather(input_,
+                                    gather_list,
+                                    dst=self.ranks[dst],
+                                    group=self.device_group)
+            if self.rank_in_group == dst:
+                output_tensor = torch.cat(gather_list, dim=dim)
+            else:
+                output_tensor = None
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_gather_end'):
+                dummy = None
+            return output_tensor
 
     def broadcast(self, input_: torch.Tensor, src: int = 0):
         """Broadcast the input tensor.
@@ -464,10 +521,15 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
-        # Broadcast.
-        torch.distributed.broadcast(input_,
-                                    src=self.ranks[src],
-                                    group=self.device_group)
+        with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_broadcast'):
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_broadcast_start'):
+                dummy = None
+            # Broadcast.
+            torch.distributed.broadcast(input_,
+                                        src=self.ranks[src],
+                                        group=self.device_group)
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_broadcast_end'):
+                dummy = None
         return input_
 
     def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
@@ -479,20 +541,30 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return obj
-        if self.mq_broadcaster is not None:
-            assert src == 0, "Message queue broadcaster only supports src=0"
-            return self.mq_broadcaster.broadcast_object(obj)
-        if self.rank_in_group == src:
-            torch.distributed.broadcast_object_list([obj],
-                                                    src=self.ranks[src],
-                                                    group=self.cpu_group)
-            return obj
-        else:
-            recv = [None]
-            torch.distributed.broadcast_object_list(recv,
-                                                    src=self.ranks[src],
-                                                    group=self.cpu_group)
-            return recv[0]
+        with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_broadcast_object'):
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_broadcast_object_start'):
+                dummy = None
+            if self.mq_broadcaster is not None:
+                assert src == 0, "Message queue broadcaster only supports src=0"
+                output_ = self.mq_broadcaster.broadcast_object(obj)
+                with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_broadcast_object_end'):
+                    dummy = None
+                return output_
+            if self.rank_in_group == src:
+                torch.distributed.broadcast_object_list([obj],
+                                                        src=self.ranks[src],
+                                                        group=self.cpu_group)
+                with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_broadcast_object_end'):
+                    dummy = None
+                return obj
+            else:
+                recv = [None]
+                torch.distributed.broadcast_object_list(recv,
+                                                        src=self.ranks[src],
+                                                        group=self.cpu_group)
+                with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_broadcast_object_end'):
+                    dummy = None
+                return recv[0]
 
     def broadcast_object_list(self,
                               obj_list: List[Any],
@@ -506,11 +578,16 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return obj_list
-        # Broadcast.
-        torch.distributed.broadcast_object_list(obj_list,
-                                                src=self.ranks[src],
-                                                group=self.device_group)
-        return obj_list
+        with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_broadcast_object_list'):
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_broadcast_object_list_start'):
+                dummy = None
+            # Broadcast.
+            torch.distributed.broadcast_object_list(obj_list,
+                                                    src=self.ranks[src],
+                                                    group=self.device_group)
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_broadcast_object_list_end'):
+                dummy = None
+            return obj_list
 
     def send_object(self, obj: Any, dst: int) -> None:
         """Send the input object list to the destination rank."""
@@ -521,26 +598,32 @@ class GroupCoordinator:
         assert dst != self.rank_in_group, (
             "Invalid destination rank. Destination rank is the same "
             "as the current rank.")
+        
+        with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_send_object'):
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_send_object_start'):
+                dummy = None
 
-        # Serialize object to tensor and get the size as well
-        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
+            # Serialize object to tensor and get the size as well
+            object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
 
-        size_tensor = torch.tensor([object_tensor.numel()],
-                                   dtype=torch.long,
-                                   device="cpu")
+            size_tensor = torch.tensor([object_tensor.numel()],
+                                    dtype=torch.long,
+                                    device="cpu")
 
-        # Send object size
+            # Send object size
 
-        torch.distributed.send(size_tensor,
-                               dst=self.ranks[dst],
-                               group=self.cpu_group)
+            torch.distributed.send(size_tensor,
+                                dst=self.ranks[dst],
+                                group=self.cpu_group)
 
-        # Send object
-        torch.distributed.send(object_tensor,
-                               dst=self.ranks[dst],
-                               group=self.cpu_group)
+            # Send object
+            torch.distributed.send(object_tensor,
+                                dst=self.ranks[dst],
+                                group=self.cpu_group)
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_send_object_end'):
+                dummy = None
 
-        return None
+            return None
 
     def recv_object(self, src: int) -> Any:
         """Receive the input object list from the source rank."""
@@ -552,29 +635,36 @@ class GroupCoordinator:
             "Invalid source rank. Source rank is the same as the current rank."
         )
 
-        size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
+        with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_recv_object'):
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_recv_object_start'):
+                dummy = None
 
-        # Receive object size
-        rank_size = torch.distributed.recv(size_tensor,
-                                           src=self.ranks[src],
-                                           group=self.cpu_group)
+            size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
-        # Tensor to receive serialized objects into.
-        object_tensor = torch.empty(  # type: ignore[call-overload]
-            size_tensor.item(),  # type: ignore[arg-type]
-            dtype=torch.uint8,
-            device="cpu")
+            # Receive object size
+            rank_size = torch.distributed.recv(size_tensor,
+                                            src=self.ranks[src],
+                                            group=self.cpu_group)
 
-        rank_object = torch.distributed.recv(object_tensor,
-                                             src=self.ranks[src],
-                                             group=self.cpu_group)
+            # Tensor to receive serialized objects into.
+            object_tensor = torch.empty(  # type: ignore[call-overload]
+                size_tensor.item(),  # type: ignore[arg-type]
+                dtype=torch.uint8,
+                device="cpu")
 
-        assert rank_object == rank_size, (
-            "Received object sender rank does not match the size sender rank.")
+            rank_object = torch.distributed.recv(object_tensor,
+                                                src=self.ranks[src],
+                                                group=self.cpu_group)
 
-        obj = pickle.loads(object_tensor.numpy().tobytes())
+            assert rank_object == rank_size, (
+                "Received object sender rank does not match the size sender rank.")
 
-        return obj
+            obj = pickle.loads(object_tensor.numpy().tobytes())
+
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_recv_object_end'):
+                dummy = None
+
+            return obj
 
     def broadcast_tensor_dict(
         self,
@@ -586,80 +676,87 @@ class GroupCoordinator:
         """Broadcast the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
         """
-        # Bypass the function if we are using only 1 GPU.
-        if (not torch.distributed.is_initialized() or self.world_size == 1):
-            return tensor_dict
+        with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_broadcast_tensor_dict'):
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_broadcast_tensor_dict_start'):
+                dummy = None
+            # Bypass the function if we are using only 1 GPU.
+            if (not torch.distributed.is_initialized() or self.world_size == 1):
+                with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_broadcast_tensor_dict_end'):
+                    dummy = None
+                return tensor_dict
 
-        group = self.device_group
-        metadata_group = self.cpu_group
-        assert src < self.world_size, f"Invalid src rank ({src})"
+            group = self.device_group
+            metadata_group = self.cpu_group
+            assert src < self.world_size, f"Invalid src rank ({src})"
 
-        rank_in_group = self.rank_in_group
-        if rank_in_group == src:
-            metadata_list: List[Tuple[Any, Any]] = []
-            assert isinstance(
-                tensor_dict,
-                dict), (f"Expecting a dictionary, got {type(tensor_dict)}")
-            metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-            # `metadata_list` lives in CPU memory.
-            # `broadcast_object_list` has serialization & deserialization,
-            # all happening on CPU. Therefore, we can use the CPU group.
-            self.broadcast_object(metadata_list, src=src)
-            async_handles = []
-            for tensor in tensor_list:
-                if tensor.numel() == 0:
-                    # Skip broadcasting empty tensors.
-                    continue
-                if tensor.is_cpu:
-                    # use metadata_group for CPU tensors
-                    handle = torch.distributed.broadcast(tensor,
-                                                         src=self.ranks[src],
-                                                         group=metadata_group,
-                                                         async_op=True)
-                else:
-                    # use group for GPU tensors
-                    handle = torch.distributed.broadcast(tensor,
-                                                         src=self.ranks[src],
-                                                         group=group,
-                                                         async_op=True)
-                async_handles.append(handle)
-            for async_handle in async_handles:
-                async_handle.wait()
-
-        else:
-            metadata_list = self.broadcast_object(None, src=src)
-            tensor_dict = {}
-            async_handles = []
-            for key, value in metadata_list:
-                if isinstance(value, TensorMetadata):
-                    tensor = torch.empty(value.size,
-                                         dtype=value.dtype,
-                                         device=value.device)
+            rank_in_group = self.rank_in_group
+            if rank_in_group == src:
+                metadata_list: List[Tuple[Any, Any]] = []
+                assert isinstance(
+                    tensor_dict,
+                    dict), (f"Expecting a dictionary, got {type(tensor_dict)}")
+                metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+                # `metadata_list` lives in CPU memory.
+                # `broadcast_object_list` has serialization & deserialization,
+                # all happening on CPU. Therefore, we can use the CPU group.
+                self.broadcast_object(metadata_list, src=src)
+                async_handles = []
+                for tensor in tensor_list:
                     if tensor.numel() == 0:
                         # Skip broadcasting empty tensors.
-                        tensor_dict[key] = tensor
                         continue
                     if tensor.is_cpu:
                         # use metadata_group for CPU tensors
-                        handle = torch.distributed.broadcast(
-                            tensor,
-                            src=self.ranks[src],
-                            group=metadata_group,
-                            async_op=True)
+                        handle = torch.distributed.broadcast(tensor,
+                                                            src=self.ranks[src],
+                                                            group=metadata_group,
+                                                            async_op=True)
                     else:
                         # use group for GPU tensors
-                        handle = torch.distributed.broadcast(
-                            tensor,
-                            src=self.ranks[src],
-                            group=group,
-                            async_op=True)
+                        handle = torch.distributed.broadcast(tensor,
+                                                            src=self.ranks[src],
+                                                            group=group,
+                                                            async_op=True)
                     async_handles.append(handle)
-                    tensor_dict[key] = tensor
-                else:
-                    tensor_dict[key] = value
-            for async_handle in async_handles:
-                async_handle.wait()
-        return tensor_dict
+                for async_handle in async_handles:
+                    async_handle.wait()
+
+            else:
+                metadata_list = self.broadcast_object(None, src=src)
+                tensor_dict = {}
+                async_handles = []
+                for key, value in metadata_list:
+                    if isinstance(value, TensorMetadata):
+                        tensor = torch.empty(value.size,
+                                            dtype=value.dtype,
+                                            device=value.device)
+                        if tensor.numel() == 0:
+                            # Skip broadcasting empty tensors.
+                            tensor_dict[key] = tensor
+                            continue
+                        if tensor.is_cpu:
+                            # use metadata_group for CPU tensors
+                            handle = torch.distributed.broadcast(
+                                tensor,
+                                src=self.ranks[src],
+                                group=metadata_group,
+                                async_op=True)
+                        else:
+                            # use group for GPU tensors
+                            handle = torch.distributed.broadcast(
+                                tensor,
+                                src=self.ranks[src],
+                                group=group,
+                                async_op=True)
+                        async_handles.append(handle)
+                        tensor_dict[key] = tensor
+                    else:
+                        tensor_dict[key] = value
+                for async_handle in async_handles:
+                    async_handle.wait()
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_broadcast_tensor_dict_end'):
+                dummy = None
+            return tensor_dict
 
     def send_tensor_dict(
         self,
@@ -670,58 +767,65 @@ class GroupCoordinator:
         """Send the input tensor dictionary.
         NOTE: `dst` is the local rank of the source rank.
         """
-        # Bypass the function if we are using only 1 GPU.
-        if not torch.distributed.is_initialized() or self.world_size == 1:
-            return tensor_dict
+        with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_send_tensor_dict'):
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_send_tensor_dict_start'):
+                dummy = None
+            # Bypass the function if we are using only 1 GPU.
+            if not torch.distributed.is_initialized() or self.world_size == 1:
+                with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_send_tensor_dict_end'):
+                    dummy = None
+                return tensor_dict
 
-        all_gather_size = (1 if all_gather_group is None else
-                           all_gather_group.world_size)
-        all_gather_rank = (0 if all_gather_group is None else
-                           all_gather_group.rank_in_group)
+            all_gather_size = (1 if all_gather_group is None else
+                            all_gather_group.world_size)
+            all_gather_rank = (0 if all_gather_group is None else
+                            all_gather_group.rank_in_group)
 
-        group = self.device_group
-        metadata_group = self.cpu_group
+            group = self.device_group
+            metadata_group = self.cpu_group
 
-        if dst is None:
-            dst = (self.rank_in_group + 1) % self.world_size
-        assert dst < self.world_size, f"Invalid dst rank ({dst})"
+            if dst is None:
+                dst = (self.rank_in_group + 1) % self.world_size
+            assert dst < self.world_size, f"Invalid dst rank ({dst})"
 
-        metadata_list: List[Tuple[Any, Any]] = []
-        assert isinstance(
-            tensor_dict,
-            dict), f"Expecting a dictionary, got {type(tensor_dict)}"
-        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-        # `metadata_list` lives in CPU memory.
-        # `send_object_list` has serialization & deserialization,
-        # all happening on CPU. Therefore, we can use the CPU group.
-        self.send_object(metadata_list, dst=dst)
-        for tensor in tensor_list:
-            if tensor.numel() == 0:
-                # Skip sending empty tensors.
-                continue
+            metadata_list: List[Tuple[Any, Any]] = []
+            assert isinstance(
+                tensor_dict,
+                dict), f"Expecting a dictionary, got {type(tensor_dict)}"
+            metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+            # `metadata_list` lives in CPU memory.
+            # `send_object_list` has serialization & deserialization,
+            # all happening on CPU. Therefore, we can use the CPU group.
+            self.send_object(metadata_list, dst=dst)
+            for tensor in tensor_list:
+                if tensor.numel() == 0:
+                    # Skip sending empty tensors.
+                    continue
 
-            # send-allgather: send only a slice, then do allgather.
-            if (all_gather_group is not None
-                    and tensor.numel() % all_gather_size == 0):
-                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                # send-allgather: send only a slice, then do allgather.
+                if (all_gather_group is not None
+                        and tensor.numel() % all_gather_size == 0):
+                    tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
-            if tensor.is_cpu:
-                # use metadata_group for CPU tensors
-                torch.distributed.send(tensor,
-                                       dst=self.ranks[dst],
-                                       group=metadata_group)
-            elif self.force_cpu:
-                # use metadata_group for CPU tensors
-                tensor = tensor.to('cpu')
-                torch.distributed.send(tensor,
-                                       dst=self.ranks[dst],
-                                       group=metadata_group)
-            else:
-                # use group for GPU tensors
-                torch.distributed.send(tensor,
-                                       dst=self.ranks[dst],
-                                       group=group)
-        return None
+                if tensor.is_cpu:
+                    # use metadata_group for CPU tensors
+                    torch.distributed.send(tensor,
+                                        dst=self.ranks[dst],
+                                        group=metadata_group)
+                elif self.force_cpu:
+                    # use metadata_group for CPU tensors
+                    tensor = tensor.to('cpu')
+                    torch.distributed.send(tensor,
+                                        dst=self.ranks[dst],
+                                        group=metadata_group)
+                else:
+                    # use group for GPU tensors
+                    torch.distributed.send(tensor,
+                                        dst=self.ranks[dst],
+                                        group=group)
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_send_tensor_dict_end'):
+                dummy = None
+            return None
 
     def recv_tensor_dict(
         self,
@@ -731,70 +835,77 @@ class GroupCoordinator:
         """Recv the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
         """
-        # Bypass the function if we are using only 1 GPU.
-        if not torch.distributed.is_initialized() or self.world_size == 1:
-            return None
+        with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_recv_tensor_dict'):
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_recv_tensor_dict_start'):
+                dummy = None
+            # Bypass the function if we are using only 1 GPU.
+            if not torch.distributed.is_initialized() or self.world_size == 1:
+                with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_recv_tensor_dict_end'):
+                    dummy = None
+                return None
 
-        all_gather_size = (1 if all_gather_group is None else
-                           all_gather_group.world_size)
-        all_gather_rank = (0 if all_gather_group is None else
-                           all_gather_group.rank_in_group)
+            all_gather_size = (1 if all_gather_group is None else
+                            all_gather_group.world_size)
+            all_gather_rank = (0 if all_gather_group is None else
+                            all_gather_group.rank_in_group)
 
-        group = self.device_group
-        metadata_group = self.cpu_group
+            group = self.device_group
+            metadata_group = self.cpu_group
 
-        if src is None:
-            src = (self.rank_in_group - 1) % self.world_size
-        assert src < self.world_size, f"Invalid src rank ({src})"
+            if src is None:
+                src = (self.rank_in_group - 1) % self.world_size
+            assert src < self.world_size, f"Invalid src rank ({src})"
 
-        recv_metadata_list = self.recv_object(src=src)
-        tensor_dict: Dict[str, Any] = {}
-        for key, value in recv_metadata_list:
-            if isinstance(value, TensorMetadata):
-                tensor = torch.empty(value.size,
-                                     dtype=value.dtype,
-                                     device=value.device)
-                if tensor.numel() == 0:
-                    # Skip broadcasting empty tensors.
+            recv_metadata_list = self.recv_object(src=src)
+            tensor_dict: Dict[str, Any] = {}
+            for key, value in recv_metadata_list:
+                if isinstance(value, TensorMetadata):
+                    tensor = torch.empty(value.size,
+                                        dtype=value.dtype,
+                                        device=value.device)
+                    if tensor.numel() == 0:
+                        # Skip broadcasting empty tensors.
+                        tensor_dict[key] = tensor
+                        continue
+
+                    # send-allgather: send only a slice, then do allgather.
+                    use_all_gather = (all_gather_group is not None
+                                    and tensor.numel() % all_gather_size == 0)
+
+                    if use_all_gather:
+                        orig_shape = tensor.shape
+                        tensor = tensor.reshape(all_gather_size,
+                                                -1)[all_gather_rank]
+
+                    if tensor.is_cpu:
+                        # use metadata_group for CPU tensors
+                        torch.distributed.recv(tensor,
+                                            src=self.ranks[src],
+                                            group=metadata_group)
+                    elif self.force_cpu:
+                        # use metadata_group for CPU tensors
+                        tensor = tensor.to('cpu')
+                        torch.distributed.recv(tensor,
+                                            src=self.ranks[src],
+                                            group=metadata_group)
+                        tensor = tensor.to(device=value.device)
+                    else:
+                        # use group for GPU tensors
+                        torch.distributed.recv(tensor,
+                                            src=self.ranks[src],
+                                            group=group)
+                    if use_all_gather:
+                        # do the allgather
+                        tensor = all_gather_group.all_gather(  # type: ignore
+                            tensor, dim=0)
+                        tensor = tensor.reshape(orig_shape)
+
                     tensor_dict[key] = tensor
-                    continue
-
-                # send-allgather: send only a slice, then do allgather.
-                use_all_gather = (all_gather_group is not None
-                                  and tensor.numel() % all_gather_size == 0)
-
-                if use_all_gather:
-                    orig_shape = tensor.shape
-                    tensor = tensor.reshape(all_gather_size,
-                                            -1)[all_gather_rank]
-
-                if tensor.is_cpu:
-                    # use metadata_group for CPU tensors
-                    torch.distributed.recv(tensor,
-                                           src=self.ranks[src],
-                                           group=metadata_group)
-                elif self.force_cpu:
-                    # use metadata_group for CPU tensors
-                    tensor = tensor.to('cpu')
-                    torch.distributed.recv(tensor,
-                                           src=self.ranks[src],
-                                           group=metadata_group)
-                    tensor = tensor.to(device=value.device)
                 else:
-                    # use group for GPU tensors
-                    torch.distributed.recv(tensor,
-                                           src=self.ranks[src],
-                                           group=group)
-                if use_all_gather:
-                    # do the allgather
-                    tensor = all_gather_group.all_gather(  # type: ignore
-                        tensor, dim=0)
-                    tensor = tensor.reshape(orig_shape)
-
-                tensor_dict[key] = tensor
-            else:
-                tensor_dict[key] = value
-        return tensor_dict
+                    tensor_dict[key] = value
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_recv_tensor_dict_end'):
+                dummy = None
+            return tensor_dict
 
     def barrier(self):
         """Barrier synchronization among the group.
@@ -803,7 +914,12 @@ class GroupCoordinator:
         secretly created GPU tensors. It is easy to mess up the current
         device. Use the CPU group instead.
         """
-        torch.distributed.barrier(group=self.cpu_group)
+        with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_barrier'):
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_barrier_start'):
+                dummy = None
+            torch.distributed.barrier(group=self.cpu_group)
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_barrier_end'):
+                dummy = None
 
     def send(self, tensor: torch.Tensor, dst: Optional[int] = None) -> None:
         """Sends a tensor to the destination rank in a non-blocking way"""
@@ -811,11 +927,18 @@ class GroupCoordinator:
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
 
-        pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
-            pynccl_comm.send(tensor, dst)
-        else:
-            torch.distributed.send(tensor, self.ranks[dst], self.device_group)
+        with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_send'):
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_send_start'):
+                dummy = None
+
+            pynccl_comm = self.pynccl_comm
+            if pynccl_comm is not None and not pynccl_comm.disabled:
+                pynccl_comm.send(tensor, dst)
+            else:
+                torch.distributed.send(tensor, self.ranks[dst], self.device_group)
+            
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_send_end'):
+                dummy = None
 
     def recv(self,
              size: torch.Size,
@@ -826,13 +949,19 @@ class GroupCoordinator:
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
 
-        tensor = torch.empty(size, dtype=dtype, device=self.device)
-        pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
-            pynccl_comm.recv(tensor, src)
-        else:
-            torch.distributed.recv(tensor, self.ranks[src], self.device_group)
-        return tensor
+        with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_recv'):
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_recv_start'):
+                dummy = None
+
+            tensor = torch.empty(size, dtype=dtype, device=self.device)
+            pynccl_comm = self.pynccl_comm
+            if pynccl_comm is not None and not pynccl_comm.disabled:
+                pynccl_comm.recv(tensor, src)
+            else:
+                torch.distributed.recv(tensor, self.ranks[src], self.device_group)
+            with self.profiler.record_event('internal', f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_{self.group_name}_group_recv_end'):
+                dummy = None
+            return tensor
 
     def destroy(self):
         if self.device_group is not None:
@@ -879,6 +1008,7 @@ def init_model_parallel_group(
     use_custom_allreduce: Optional[bool] = None,
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
+    profiler: Optional[HabanaHighLevelProfiler] = None
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -896,6 +1026,7 @@ def init_model_parallel_group(
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         force_cpu=False, #True if group_name.lower() == "pp" else False,
+        profiler=profiler,
     )
 
 
@@ -1006,6 +1137,7 @@ def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
     backend: Optional[str] = None,
+    profiler: Optional[HabanaHighLevelProfiler] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1045,7 +1177,6 @@ def initialize_model_parallel(
     # Build the tensor model-parallel groups.
     num_tensor_model_parallel_groups: int = (world_size //
                                              tensor_model_parallel_size)
-
     global _TP
     assert _TP is None, ("tensor model parallel group is already initialized")
     group_ranks = []
@@ -1060,7 +1191,8 @@ def initialize_model_parallel(
                                     get_world_group().local_rank,
                                     backend,
                                     use_message_queue_broadcaster=True,
-                                    group_name="tp")
+                                    group_name="tp",
+                                    profiler=profiler)
 
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = (world_size //
@@ -1077,7 +1209,8 @@ def initialize_model_parallel(
                                     get_world_group().local_rank,
                                     backend,
                                     use_custom_allreduce=False,
-                                    group_name="pp")
+                                    group_name="pp",
+                                    profiler=profiler)
 
 
 def ensure_kv_transfer_initialized(vllm_config: "VllmConfig") -> None:
@@ -1104,6 +1237,7 @@ def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
     backend: Optional[str] = None,
+    profiler: Optional[HabanaHighLevelProfiler] = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -1113,8 +1247,7 @@ def ensure_model_parallel_initialized(
         get_world_group().device_group)
     if not model_parallel_is_initialized():
         initialize_model_parallel(tensor_model_parallel_size,
-                                  pipeline_model_parallel_size,
-                                  backend)
+                                  pipeline_model_parallel_size, backend, profiler=profiler)
         return
 
     assert (

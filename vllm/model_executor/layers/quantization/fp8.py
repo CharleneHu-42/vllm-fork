@@ -1059,7 +1059,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if self.quant_config.activation_scheme == "dynamic":
             x_fp8, x_scale = dynamic_quant(x)
-        else:
+        elif layer.w13_input_scale is not None:
             x_scale = layer.w13_input_scale.data
             x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0 / x_scale, False,
                                                  False, torch.float8_e4m3fn)[0]

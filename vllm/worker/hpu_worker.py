@@ -218,7 +218,8 @@ class HPUWorker(LocalOrDistributedWorkerBase):
             self._set_env_vars()
         init_worker_distributed_environment(self.parallel_config, self.rank,
                                             self.distributed_init_method,
-                                            self.local_rank)
+                                            self.local_rank,
+                                            profiler=self.model_runner.profiler)
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
@@ -508,6 +509,7 @@ def init_worker_distributed_environment(
     rank: int,
     distributed_init_method: Optional[str] = None,
     local_rank: int = -1,
+    profiler: Optional[Any] = None,
 ) -> None:
     """Initialize the distributed environment."""
     backend = hpu_backend_string()
@@ -518,8 +520,13 @@ def init_worker_distributed_environment(
                                  backend=backend)
 
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
-                                      parallel_config.pipeline_parallel_size)
-
+                                      parallel_config.pipeline_parallel_size,
+                                      profiler=profiler)
+    
+    if parallel_config.pipeline_parallel_size > 1:
+        # torch-ccl xpu need a collective API warm up
+        # before calling send/recv API
+        get_pp_group().all_reduce(torch.zeros(1).to('hpu'))
     if torch.distributed.is_initialized():
         torch_world_size = torch.distributed.get_world_size()
         if torch_world_size != parallel_config.world_size:
@@ -543,11 +550,11 @@ def init_worker_distributed_environment(
     # A small all_reduce for warmup & checking conformance.
     device = hpu_device_string()
     dummy_tensor_hpu = torch.ones(1).to(device)
-    get_tp_group().all_reduce(dummy_tensor_hpu)
-    assert dummy_tensor_hpu.item() == parallel_config.tensor_parallel_size
+    torch.distributed.all_reduce(dummy_tensor_hpu)
+    assert dummy_tensor_hpu.item() == parallel_config.world_size
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
-                                      parallel_config.pipeline_parallel_size)
-
+                                      parallel_config.pipeline_parallel_size,
+                                      profiler=profiler)
 
 def raise_if_cache_size_invalid(num_gpu_blocks, block_size,
                                 max_model_len) -> None:

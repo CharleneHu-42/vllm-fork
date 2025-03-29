@@ -20,6 +20,7 @@ from vllm.attention.backends.utils import CommonAttentionState
 from vllm.attention.ops.hpu_paged_attn import (HPUPagedAttention,
                                                HPUPagedAttentionMetadata)
 from vllm.logger import init_logger
+from vllm.distributed import get_pp_group, get_tp_group
 
 logger = init_logger(__name__)
 
@@ -205,6 +206,7 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         attn_metadata: HPUAttentionMetadata,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_HPUMLAImpl_forward_start')
         if output is not None:
             raise NotImplementedError(
                 "output is not yet supported for MLAImplBase")
@@ -268,9 +270,13 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             kv_cache = (k_cache, v_cache)
 
         if is_prefill:
-            return self._forward_prefill(q, k_c_normed, k_pe, attn_metadata, batch_size)
+            output_ = self._forward_prefill(q, k_c_normed, k_pe, attn_metadata, batch_size)
+            logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_HPUMLAImpl_forward_end_1')
+            return output_
         else:
-            return self._forward_decode(q_nope, q_pe, kv_cache, attn_metadata, batch_size)
+            output_ = self._forward_decode(q_nope, q_pe, kv_cache, attn_metadata, batch_size)
+            logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_HPUMLAImpl_forward_end_2')
+            return output_
     
     def _forward_prefill(
         self,
@@ -441,9 +447,10 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_HPUAttentionImpl_forward_start')
         assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0
         if self.attn_type == AttentionType.ENCODER_DECODER:
-            return self.forward_encoder_decoder(
+            output_ = self.forward_encoder_decoder(
                 query=query,
                 key=key,
                 value=value,
@@ -452,6 +459,8 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                 k_scale=layer._k_scale_float,
                 v_scale=layer._k_scale_float,
             )
+            logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_HPUAttentionImpl_forward_end_1')
+            return output_
 
         batch_size, seq_len, hidden_size = query.shape
         _, seq_len_kv, _ = key.shape
@@ -546,7 +555,9 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                 keys_fetch_func=self.k_cache.fetch_from_cache,
                 values_fetch_func=self.v_cache.fetch_from_cache)
         # Reshape the output tensor.
-        return output.view(batch_size, seq_len, hidden_size)
+        output_ = output.view(batch_size, seq_len, hidden_size)
+        logger.info(f'tp{get_tp_group().rank_in_group}_pp{get_pp_group().rank_in_group}_HPUAttentionImpl_forward_end_1')
+        return output_
 
     def forward_encoder_decoder(
         self,
