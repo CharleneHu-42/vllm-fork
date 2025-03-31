@@ -531,6 +531,19 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     "VLLM_MLA_DISABLE_REQUANTIZATION":
     lambda: bool(int(os.getenv("VLLM_MLA_DISABLE_REQUANTIZATION", "1"))),
 
+    # When enabled, this flag uses a single tensor for the KV cache instead of 
+    # separate tensors for keys and values. This can reduce memory overhead 
+    # but may impact performance depending on the workload and hardware.
+    "VLLM_USE_SINGLE_TENSOR_CACHE":
+    lambda: bool(int(os.getenv("VLLM_USE_SINGLE_TENSOR_CACHE", "0"))),
+
+    # When enabled, this flag uses FP8 (8-bit floating point) precision for 
+    # matrix multiplications. This can significantly improve performance and 
+    # reduce memory usage, but it may lead to a loss in numerical precision 
+    # and affect model accuracy.
+    "VLLM_USE_FP8_MATMUL":
+    lambda: bool(int(os.getenv("VLLM_USE_FP8_MATMUL", "0"))),
+
     # When running pipeline parallelism on multiple nodes the primary communication channel
     # for parralel communications may not be able to communicate. This would result in hangs
     # after all_reduce/send/recv operations which PP group uses. To resolve this issue

@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
 from vllm import envs
-from vllm.attention.backends.mla.utils import MLACommonImpl
 import vllm_hpu_extension.kernels as kernels
 import vllm_hpu_extension.ops as ops
 from vllm_hpu_extension.flags import enabled_flags
@@ -15,13 +14,94 @@ from vllm_hpu_extension.utils import (Matmul, ModuleFusedSDPA, Softmax,
                                       VLLMKVCache)
 
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
-                                              AttentionMetadata, AttentionType, AttentionLayer)
+                                              AttentionLayer,
+                                              AttentionMetadata, AttentionType)
+from vllm.attention.backends.mla.utils import MLACommonImpl
 from vllm.attention.backends.utils import CommonAttentionState
 from vllm.attention.ops.hpu_paged_attn import (HPUPagedAttention,
                                                HPUPagedAttentionMetadata)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def initialize_fp8_kv_cache(mod, load_device="hpu"):
+
+    class FP8VLLMKVCache(torch.nn.Module):
+
+        def __init__(self, mod):
+            super().__init__()
+            self.orig_mod = mod
+            self.scale_input = torch.tensor(1.0,
+                                            dtype=torch.bfloat16,
+                                            device=load_device)
+
+        def quant_input(self, x, input_scale=None):
+            return torch.ops.hpu.cast_to_fp8_v2(x, input_scale, False, False,
+                                                torch.float8_e4m3fn)[0]
+
+        def forward(self, input, *args, **kwargs):
+            qinput = self.quant_input(input, input_scale=self.scale_input)
+            return self.orig_mod(qinput, *args, **kwargs)
+
+        def fetch_from_cache(self, quant_cache, blocks, permutations=None):
+            if permutations:
+                output_cache = self.orig_mod.fetch_from_cache(
+                    quant_cache, blocks, permutations)
+                return output_cache
+            output_cache = self.orig_mod.fetch_from_cache(quant_cache, blocks)
+            return output_cache
+
+    return FP8VLLMKVCache(mod)
+
+
+def initialize_fp8_matmul(mod, load_device="hpu"):
+
+    class FP8Matmul(torch.nn.Module):
+
+        def __init__(self, mod):
+            super().__init__()
+            self.orig_mod = mod
+            self.scale_input = torch.tensor(1.0,
+                                            dtype=torch.bfloat16,
+                                            device=load_device)
+            self.scale_other = torch.tensor(1.0,
+                                            dtype=torch.bfloat16,
+                                            device=load_device)
+
+        def quant_input(self, x):
+            return torch.ops.hpu.cast_to_fp8_v2(x, 1.0, False, False,
+                                                torch.float8_e4m3fn)[0]
+
+        def matmul_fp8(self,
+                       x,
+                       other,
+                       out_dtype,
+                       scale_input_inv=None,
+                       scale_other_inv=None):
+            return torch.ops.hpu.fp8_gemm_v2(A=x,
+                                             trans_A=False,
+                                             B=other,
+                                             trans_B=False,
+                                             D=None,
+                                             out_dtype=out_dtype,
+                                             A_scale_inv=scale_input_inv,
+                                             B_scale_inv=scale_other_inv,
+                                             bias=None,
+                                             accumulate=False)
+
+        def forward(self, input, other):
+            qinput = self.quant_input(input)
+            qother = other
+            #qother = self.quant_input_1(other)
+            output = self.matmul_fp8(qinput,
+                                     qother,
+                                     out_dtype=torch.bfloat16,
+                                     scale_input_inv=self.scale_input,
+                                     scale_other_inv=self.scale_other)
+            return output
+
+    return FP8Matmul(mod)
 
 
 class HPUAttentionBackend(AttentionBackend):
@@ -86,10 +166,56 @@ class HPUMLAAttentionBackend(HPUAttentionBackend):
     def get_name() -> str:
         return "HPU_MLA"
 
+
+def _pipelined_pa(attn, value, block_groups, block_mapping, block_scales,
+                  batch_size, matmul_av_op, batch2block_matmul_op,
+                  block2batch_matmul_op):
+    # When fp32_softmax is enabled attn is left in fp32 after Q@K
+    # We can return to native dtype after we renormalize and calculate
+    # the adjustments
+
+    # Normalize the attention scores and cast attn to native dtype
+    block_max = attn.amax(dim=-1, keepdim=True)
+    adjustment_target_shape = block_max.shape
+    attn = attn.sub(block_max)
+    attn = attn.exp()
+    #attn = attn.to(value.dtype)
+    block_sums = attn.sum(dim=-1, keepdim=True)
+    attn = matmul_av_op(attn, value)
+    # qother = self.quant_input_1(other)
+    block_max = block_max.squeeze()
+    block_sums = block_sums.squeeze()
+
+    # Calculate maximum of blocks that belong to the same sequences
+    # and cast adjustments to native dtype
+    group_max = ops.grouped_max(block_max, batch_size, block_groups)
+    block_adjustment = (block_max - group_max).exp()
+    #block_adjustment = block_adjustment.to(value.dtype)
+    sum_adjusted = block_sums.mul(block_adjustment)
+
+    # Sum block's sums that belongs to the same sequences
+    group_sum_adjusted = ops.block2batch(sum_adjusted, block_mapping,
+                                         block2batch_matmul_op)
+    group_sum_adjusted = ops.batch2block(group_sum_adjusted, block_mapping,
+                                         batch2block_matmul_op)
+    sum_adjusted = sum_adjusted.view(*adjustment_target_shape)
+    group_sum_adjusted = group_sum_adjusted.view(*adjustment_target_shape)
+    block_adjustment = block_adjustment.view(*adjustment_target_shape)
+
+    # For stability in case some of the sums have been zeroed out during
+    # block aggretation
+    group_sum_adjusted = torch.maximum(group_sum_adjusted, sum_adjusted)
+
+    # Post processing for the attention scores
+    rescale = block_adjustment.div(group_sum_adjusted)
+    attn = attn.mul(rescale)
+    return attn
+
+
 def flat_pa_mla(q_nope, q_pe, key_cache, value_cache, block_list, block_mapping,
-            block_bias, block_scales, block_groups, scale, matmul_qk_op,
-            matmul_av_op, batch2block_matmul_op, block2batch_matmul_op,
-            keys_fetch_func, values_fetch_func):
+                block_bias, block_scales, block_groups, scale, matmul_qk_op,
+                matmul_av_op, batch2block_matmul_op, block2batch_matmul_op,
+                keys_fetch_func, values_fetch_func, kv_in_fp8):
     batch_size = q_nope.size(0)
     q_heads = q_nope.size(1)
     kv_heads = key_cache.size(2)
@@ -118,14 +244,34 @@ def flat_pa_mla(q_nope, q_pe, key_cache, value_cache, block_list, block_mapping,
         import habana_frameworks.torch.core as htcore
         htcore.mark_step()
     attn = attn + block_bias
-    attn = ops.pipelined_pa(attn, value, block_groups, block_mapping, block_scales=block_scales,
-                        batch_size=batch_size, matmul_av_op=matmul_av_op,
-                        batch2block_matmul_op=batch2block_matmul_op, block2batch_matmul_op=block2batch_matmul_op)
+    if kv_in_fp8:
+        # Chendi: This is a workaround for manually
+        # remove dequant/quant for performance
+        attn = _pipelined_pa(attn,
+                             value,
+                             block_groups,
+                             block_mapping,
+                             block_scales=block_scales,
+                             batch_size=batch_size,
+                             matmul_av_op=matmul_av_op,
+                             batch2block_matmul_op=batch2block_matmul_op,
+                             block2batch_matmul_op=block2batch_matmul_op)
+    else:
+        attn = ops.pipelined_pa(attn,
+                                value,
+                                block_groups,
+                                block_mapping,
+                                block_scales=block_scales,
+                                batch_size=batch_size,
+                                matmul_av_op=matmul_av_op,
+                                batch2block_matmul_op=batch2block_matmul_op,
+                                block2batch_matmul_op=block2batch_matmul_op)
     attn = ops.block2batch(attn, block_mapping, block2batch_matmul_op)
     attn = attn.squeeze(-2)
     if kv_heads != q_heads:
         attn = attn.flatten(1, 2)
     return attn
+
 
 @dataclass
 class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
@@ -149,7 +295,7 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     cross_block_scales: Optional[torch.Tensor] = None
     cross_block_usage: Optional[torch.Tensor] = None
     cross_attn_bias: Optional[torch.Tensor] = None
-    
+
 
 class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
 
@@ -179,6 +325,24 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         self.block2batch_matmul = Matmul()
         self.latent_cache_k = VLLMKVCache()
         self.latent_cache_v = VLLMKVCache()
+        self.use_fp8_matmul = envs.VLLM_USE_FP8_MATMUL
+
+        if self.use_fp8_matmul:
+            self.latent_cache_k_nodeq = VLLMKVCache()
+            self.latent_cache_v_nodeq = VLLMKVCache()
+            self.latent_cache_k_nodeq = initialize_fp8_kv_cache(
+                self.latent_cache_k_nodeq)
+            self.latent_cache_v_nodeq = initialize_fp8_kv_cache(
+                self.latent_cache_v_nodeq)
+            self.matmul_qk_decode = initialize_fp8_matmul(self.matmul_qk)
+            self.matmul_av_decode = initialize_fp8_matmul(self.matmul_av)
+        else:
+            self.latent_cache_k = VLLMKVCache()
+            self.latent_cache_v = VLLMKVCache()
+        
+
+        self.prefill_use_fusedsdpa = "fsdpa" in enabled_flags()
+
         HPUFusedSDPA = kernels.fsdpa()
         self.fused_scaled_dot_product_attention = None if HPUFusedSDPA is None \
             else ModuleFusedSDPA(HPUFusedSDPA)
@@ -234,14 +398,14 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         else:
             q = self.q_proj(hidden_states_or_q_c)[0]\
                 .view(-1, self.num_heads, self.qk_head_dim)
-            
+
             q_pe = q[..., self.qk_nope_head_dim:]
 
             input_positions = attn_metadata.input_positions.view(-1)
             # TODO(lucas): there must be a nicer way to write this line
             q[..., self.qk_nope_head_dim:], k_pe = \
                 self.rotary_emb(input_positions, q_pe, k_pe)
-        
+
         block_indices = attn_metadata.block_indices
         block_offsets = attn_metadata.block_offsets
 
@@ -252,16 +416,8 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         #latent_vec_v = k_c_normed.view(-1, self.kv_lora_rank)
         if is_prefill:
             latent_vec_k = latent_vec_k.unflatten(0, (block_indices.size(0), -1))
-            #latent_vec_v = latent_vec_v.unflatten(0, (block_indices.size(0), -1))
-        # print("latent_vec", latent_vec.shape)
-
-
         # write the latent and rope to kv cache
         if kv_cache is not None and len(kv_cache) == 2:
-            # print(f"k cache shape: {kv_cache[0].shape}")
-            # print(f"v cache shape: {kv_cache[1].shape}")
-            # print(f"latent vec k shape: {latent_vec_k.shape}")
-            # print(f"latent vec v shape: {latent_vec_v.shape}")
             latent_vec_v = latent_vec_k[..., :self.kv_lora_rank]
             latent_vec_k = latent_vec_k[..., self.kv_lora_rank:]
             k_cache = self.latent_cache_k(latent_vec_k, kv_cache[0], block_indices,
@@ -274,7 +430,7 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             return self._forward_prefill(q, k_c_normed, k_pe, attn_metadata, batch_size)
         else:
             return self._forward_decode(q_nope, q_pe, kv_cache, attn_metadata, batch_size)
-    
+
     def _forward_prefill(
         self,
         q: torch.Tensor,
@@ -298,24 +454,25 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         k = k.view(batch_size, -1, self.num_heads, self.qk_head_dim)
         v_padded = v_padded.view(batch_size, -1, self.num_heads, self.qk_head_dim)
         out = ops.prompt_attention(
-                    q,
-                    k,
-                    v_padded,
-                    attn_bias=None,
-                    p=0.0,
-                    scale=self.scale,
-                    matmul_qk_op=self.matmul_qk,
-                    softmax_op=self.softmax,
-                    matmul_av_op=self.matmul_av,
-                    valid_seq_lengths=attn_metadata.seq_lens_tensor,
-                    fsdpa_op=self.fused_scaled_dot_product_attention,
-                )
-        attn_output = out\
-            .view(batch_size, -1, self.num_heads, q.shape[-1])[..., :v.shape[-1]]\
+            q,
+            k,
+            v_padded,
+            attn_bias=attn_metadata.attn_bias,
+            p=0.0,
+            scale=self.scale,
+            matmul_qk_op=self.matmul_qk,
+            softmax_op=self.softmax,
+            matmul_av_op=self.matmul_av,
+            valid_seq_lengths=attn_metadata.seq_lens_tensor,
+            fsdpa_op=self.fused_scaled_dot_product_attention
+            if self.prefill_use_fusedsdpa else None,
+        )
+        attn_output = out.view(batch_size, -1, self.num_heads, q.shape[-1])
+        attn_output = attn_output[..., :v.shape[-1]]\
                 .reshape(batch_size, -1, self.num_heads * v.shape[-1])
 
         return self.o_proj(attn_output)[0]
-    
+
     def _forward_decode(
         self,
         q_nope: torch.Tensor,
@@ -338,12 +495,20 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             block_scales=attn_metadata.block_scales,
             block_groups=attn_metadata.block_groups,
             scale=self.scale,
-            matmul_qk_op=self.matmul_qk,
-            matmul_av_op=self.matmul_av,
+            matmul_qk_op=self.matmul_qk
+            if not self.use_fp8_matmul else self.matmul_qk_decode,
+            matmul_av_op=self.matmul_av
+            if not self.use_fp8_matmul else self.matmul_av_decode,
             batch2block_matmul_op=self.batch2block_matmul,
             block2batch_matmul_op=self.block2batch_matmul,
-            keys_fetch_func=self.latent_cache_k.fetch_from_cache,
-            values_fetch_func=self.latent_cache_v.fetch_from_cache)
+            keys_fetch_func=self.latent_cache_k.fetch_from_cache
+            if not self.use_fp8_matmul else
+            self.latent_cache_k_nodeq.fetch_from_cache,
+            values_fetch_func=self.latent_cache_v.fetch_from_cache
+            if not self.use_fp8_matmul else
+            self.latent_cache_v_nodeq.fetch_from_cache,
+            kv_in_fp8=self.use_fp8_matmul,
+        )
         output = output.view(batch_size, 1, -1)
         result = self._v_up_proj_and_o_proj(output)
         result = result.view(batch_size, 1, -1)
