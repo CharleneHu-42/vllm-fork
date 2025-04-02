@@ -5,9 +5,7 @@ from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import torch
-import os
 
-import torch.distributed
 from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
@@ -31,9 +29,6 @@ if current_platform.is_tpu():
 else:
     fused_moe_pallas = None  # type: ignore
 logger = init_logger(__name__)
-
-
-VLLM_REQUANT_FP8_INC = os.getenv("VLLM_REQUANT_FP8_INC", "0") in ["1", "true"]
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -122,8 +117,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None,
-        ep_rank: Optional[int] = None,
+        e_score_correction_bias: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         return self.forward(x=x,
                             layer=layer,
@@ -135,9 +129,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                             num_expert_group=num_expert_group,
                             custom_routing_function=custom_routing_function,
                             scoring_func=scoring_func,
-                            e_score_correction_bias=e_score_correction_bias,
-                            ep_rank= ep_rank,
-                            )
+                            e_score_correction_bias=e_score_correction_bias)
 
     def forward_cuda(
         self,
@@ -184,11 +176,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None,
-        ep_rank = None,
+        e_score_correction_bias: Optional[torch.Tensor] = None
     ):
-        bs, seq_len, hidden_size = x.shape
-        x = x.reshape(bs * seq_len, hidden_size)
         assert len(x.shape) == 2
         import habana_frameworks.torch as htorch
         htorch.core.mark_step()
@@ -372,28 +361,8 @@ class FusedMoE(torch.nn.Module):
         self.topk_group = topk_group
         self.custom_routing_function = custom_routing_function
         if is_hpu:
-            if VLLM_REQUANT_FP8_INC:
-                ep_shift = self.ep_rank * self.num_experts
-                from vllm.model_executor.layers.vllm_ext_patch import (
-                    VllmMixtureOfExpertsOpFP8,
-                )
-                moe_n_slice = int(os.environ.get("VLLM_MOE_N_SLICE", 4))
-                assert moe_n_slice == 1, (
-                    f"moe_n_slice is {moe_n_slice}, expected 1 when using VLLM_REQUANT_FP8_INC"
-                )
-                num_expert_per_group = self.num_experts // moe_n_slice
-                experts_min, experts_max = 0, self.num_experts
-                moe_op = VllmMixtureOfExpertsOpFP8(
-                    num_expert_per_group,
-                    experts_min + ep_shift,
-                    experts_max - 1 + ep_shift,
-                )
-                self.moe_op = moe_op
-            else:
-                from vllm_hpu_extension.ops import DynamicFusedMOE
-
-                self.hpu_fused_moe = DynamicFusedMOE(self.num_experts)
-            
+            from vllm_hpu_extension.ops import DynamicFusedMOE
+            self.hpu_fused_moe = DynamicFusedMOE(self.num_experts)
 
         self.scoring_func = scoring_func
         self.e_score_correction_bias = e_score_correction_bias
@@ -512,7 +481,7 @@ class FusedMoE(torch.nn.Module):
             expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
         expert_data.copy_(loaded_weight)
 
-        if is_hpu and not VLLM_REQUANT_FP8_INC:
+        if is_hpu:
             self.hpu_fused_moe.MoeOp.w13_list[expert_id].set_weight(
                 orig_exp_data)
             # print(f"loaded w13 for hpu for expert_id: {expert_id}, orig_exp_data.shape: {orig_exp_data.shape}")
@@ -535,7 +504,7 @@ class FusedMoE(torch.nn.Module):
                                                  shard_size)
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
-        if is_hpu and not VLLM_REQUANT_FP8_INC:
+        if is_hpu:
             self.hpu_fused_moe.MoeOp.w2_list[expert_id].set_weight(expert_data)
             # print(f"loaded w2 for hpu for expert_id: {expert_id}, expert_data.shape: {expert_data.shape}")
 

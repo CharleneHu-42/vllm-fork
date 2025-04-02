@@ -2,7 +2,7 @@
 
 import itertools
 from abc import abstractmethod
-from typing import Optional, Callable
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -183,14 +183,6 @@ class LinearBase(torch.nn.Module):
     def forward(self,
                 x: torch.Tensor) -> tuple[torch.Tensor, Optional[Parameter]]:
         raise NotImplementedError
-
-    def get_dequant_weights_func(
-        self,
-    ) -> Optional[Callable[[torch.nn.Module], torch.Tensor]]:
-        if self.quant_method is not None:
-            quant_method = self.quant_method
-            if hasattr(quant_method, "dequant_block_fp8_weight"):
-                return quant_method.dequant_block_fp8_weight
 
 
 class ReplicatedLinear(LinearBase):
