@@ -18,7 +18,7 @@ from vllm_hpu_extension.profiler import HabanaMemoryProfiler, format_bytes
 
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
-from vllm.distributed import (ensure_model_parallel_initialized, get_pp_group,
+from vllm.distributed import (ensure_model_parallel_initialized, get_pp_group, get_tp_group,
                               init_distributed_environment)
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -282,7 +282,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
 
     def init_device(self) -> None:
         if self.device_config.device.type == "hpu":
-            self.device = torch.device("hpu")
+            self.device = torch.device(f"hpu:{self.local_rank}")
             torch.hpu.set_device(self.device)
         elif self.device_config.device_type == "cpu":
             self.device = torch.device("cpu")
@@ -594,6 +594,11 @@ def init_worker_distributed_environment(
 
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
+    
+    import habana_frameworks.torch.hpu as hthpu
+    logger.info(f"[PP={get_pp_group().rank_in_group}, TP={get_tp_group().rank_in_group}] Is HPU available: {hthpu.is_available()}")
+    logger.info(f"[PP={get_pp_group().rank_in_group}, TP={get_tp_group().rank_in_group}] HPU devices: {hthpu.device_count()}")
+    logger.info(f"[PP={get_pp_group().rank_in_group}, TP={get_tp_group().rank_in_group}] HPU index: {hthpu.current_device()}")
     
     if parallel_config.pipeline_parallel_size > 1:
         # torch-ccl xpu need a collective API warm up
