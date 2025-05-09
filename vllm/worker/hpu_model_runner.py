@@ -2314,6 +2314,10 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             f"Warmup finished in {elapsed_time:.0f} secs, "
             f"allocated {format_bytes(end_mem - start_mem)} of device memory")
         logger.info(msg)
+        local_rank = torch.distributed.get_rank()
+        free_mem = HabanaMemoryProfiler.current_free_device_memory()
+        logger.info(f"[rank: {local_rank}] "
+                    f"Free device memory after warmup: {format_bytes(free_mem)}")
         self.profiler.end()
 
     def finish_measurements(self):
