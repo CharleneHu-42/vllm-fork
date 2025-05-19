@@ -383,6 +383,11 @@ def sample_random_requests(
         output_len + 1,
         size=num_prompts,
     )
+
+    seed = int(time.time())
+    random.seed(seed)
+    np.random.seed(seed)
+    print(f"Setting suffix seed to {seed}")
     offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
     input_requests = []
     for i in range(num_prompts):
@@ -927,6 +932,13 @@ def main(args: argparse.Namespace):
     # Avoid GC processing "static" data - reduce pause times.
     gc.collect()
     gc.freeze()
+    print(f"Unique prompts number: {len(set(input_requests))}")
+    # print("\n=========\n".join(map(str, input_requests[:20])))
+
+    file_name = f"prompt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    with open(file_name, "w") as file:
+        for item in input_requests:
+            file.write(f"{str(item)}\n")
 
     benchmark_result = asyncio.run(
         benchmark(
