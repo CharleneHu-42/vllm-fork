@@ -48,8 +48,8 @@ def update_mem():
     import habana_frameworks.torch as htorch 
     from vllm_hpu_extension.profiler import HabanaMemoryProfiler, format_bytes
     memory_stats = torch.hpu.memory.memory_stats()
-    local_ranl = torch.distributed.get_rank()
-    csv_file = f"vllm_memory_stats_pp_rank_{local_ranl}.csv"
+    local_rank = torch.distributed.get_rank()
+    csv_file = f"vllm_memory_stats_pp_rank_{local_rank}.csv"
 
     # Define the field names (header)
     fieldnames = [
