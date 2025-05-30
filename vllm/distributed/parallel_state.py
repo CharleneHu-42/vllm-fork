@@ -1121,8 +1121,18 @@ def initialize_model_parallel(
 
     logger.info(
         "rank %s in world size %s is assigned as "
-        "DP rank %s, PP rank %s, TP rank %s", rank, world_size,
-        _DP.rank_in_group, _PP.rank_in_group, _TP.rank_in_group)
+        "DP rank %s, PP rank %s, TP rank %s, is pp last rank %s, "
+        "is pp first rank %s, pp world size %s, ranks %s",
+        rank,
+        world_size,
+        _DP.rank_in_group,
+        _PP.rank_in_group,
+        _TP.rank_in_group,
+        _PP.is_last_rank,
+        _PP.is_first_rank,
+        _PP.world_size,
+        _PP.ranks
+    )
 
 
 def ensure_kv_transfer_initialized(vllm_config: "VllmConfig") -> None:

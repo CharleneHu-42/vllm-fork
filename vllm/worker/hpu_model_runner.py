@@ -1946,7 +1946,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                     for idx in range(batch_size)
                 ]
         self.profiler.start('internal', scenario_name)
-        times = num_iters if use_graphs or is_pt_profiler_run else 1
+        # times = num_iters if use_graphs or is_pt_profiler_run else 1
+        times = 5
         if is_prompt:
             seqs = [
                 self.create_dummy_seq_group_metadata(
