@@ -685,9 +685,7 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return tensor_dict
-        
-        if VLLM_FAKE_SEND_RECV:
-            return tensor_dict
+
 
         all_gather_size = (1 if all_gather_group is None else
                            all_gather_group.world_size)
@@ -710,6 +708,8 @@ class GroupCoordinator:
         # `send_object_list` has serialization & deserialization,
         # all happening on CPU. Therefore, we can use the CPU group.
         self.send_object(metadata_list, dst=dst)
+        if VLLM_FAKE_SEND_RECV:
+            return tensor_dict
         for tensor in tensor_list:
             if tensor.numel() == 0:
                 # Skip sending empty tensors.
