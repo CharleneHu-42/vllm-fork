@@ -996,26 +996,26 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
     def _use_graphs(self, batch_size, seq_len, is_prompt, is_profile_run=False):
         rank = torch.distributed.get_rank() 
         if is_prompt and batch_size * seq_len > self.max_seq_len_to_capture:
-            logger.info(f"[rank: {rank}] skip use graph as  is_prompt and batch_size * seq_len > self.max_seq_len_to_capture")
+            # logger.info(f"[rank: {rank}] skip use graph as  is_prompt and batch_size * seq_len > self.max_seq_len_to_capture")
             return False
         if self.enforce_eager:
-            logger.info(f"[rank: {rank}] skip use graph as enforce_eager is set to True")
+            # logger.info(f"[rank: {rank}] skip use graph as enforce_eager is set to True")
             return False
         if is_profile_run:
-            logger.info(f"[rank: {rank}] skip use graph as is_profile_run is set to True")
+            # logger.info(f"[rank: {rank}] skip use graph as is_profile_run is set to True")
             return False
         if self.skip_warmup:
-            logger.info(f"[rank: {rank}] using graph as skip_warmup is set to True")
+            # logger.info(f"[rank: {rank}] using graph as skip_warmup is set to True")
             return True
         res = (batch_size, seq_len, is_prompt) in self.graphed_buckets
-        if res:
-            logger.info(
-                f"[rank: {rank}] using graph as ({batch_size}, {seq_len}, {is_prompt}) "
-                "is in graphed buckets")
-        else:
-            logger.info(
-                f"[rank: {rank}] not using graph as ({batch_size}, {seq_len}, {is_prompt}) "
-                "is not in graphed buckets")
+        # if res:
+        #     logger.info(
+        #         f"[rank: {rank}] using graph as ({batch_size}, {seq_len}, {is_prompt}) "
+        #         "is in graphed buckets")
+        # else:
+        #     logger.info(
+        #         f"[rank: {rank}] not using graph as ({batch_size}, {seq_len}, {is_prompt}) "
+        #         "is not in graphed buckets")
         return res
 
     def _is_valid_bucket(self, bucket):

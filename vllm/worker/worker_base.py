@@ -289,11 +289,11 @@ def update_mem(shape=None):
         memory_stats['Shape'] = str(shape)
         memory_stats["FreeMem"] = memory_stats["MaxInUse"] - memory_stats["InUse"]
         writer.writerow({key: memory_stats[key] for key in fieldnames})
-        logger.warning(f"<<<<<<<<<<<<<<<<< Update mem >>>>>>>>>>>>>>>>>")
-        msg = f"Memory stats: "
-        for key in fieldnames:
-            msg += f"{key}: {str(memory_stats[key])}, "
-        logger.warning(msg)
+        # logger.warning(f"<<<<<<<<<<<<<<<<< Update mem >>>>>>>>>>>>>>>>>")
+        # msg = f"Memory stats: "
+        # for key in fieldnames:
+        #     msg += f"{key}: {str(memory_stats[key])}, "
+        # logger.warning(msg)
 
 import sys
 import pdb
