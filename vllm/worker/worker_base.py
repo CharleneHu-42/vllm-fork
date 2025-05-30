@@ -310,6 +310,9 @@ class ForkedPdb(pdb.Pdb):
             pdb.Pdb.interaction(self, *args, **kwargs)
         finally:
             sys.stdin = _stdin
+
+
+VLLM_DUMP_STEP_MEM = os.getenv("VLLM_DUMP_STEP_MEM", "0") in ["1", "true", "True", "TRUE"]
 class LocalOrDistributedWorkerBase(WorkerBase):
     """
     Partial implementation of WorkerBase that has a default `execute_model`
@@ -497,7 +500,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
                     "model_execute_time", torch.tensor(0)).item()
         _input_shape = None
         try:
-            if not get_pp_group().is_last_rank:
+            if intermediate_tensors is None:
                 _input_tokens = model_input.input_tokens
                 _input_shape = _input_tokens.shape
             else:
@@ -540,10 +543,11 @@ class LocalOrDistributedWorkerBase(WorkerBase):
             # output is List[SamplerOutput]
             # return output
             res = output
-        import habana_frameworks.torch as htorch  # noqa:F401
-        htorch.core.mark_step()
-        torch.hpu.synchronize()
-        update_mem(_input_shape)
+        if VLLM_DUMP_STEP_MEM:
+            import habana_frameworks.torch as htorch  # noqa:F401
+            htorch.core.mark_step()
+            torch.hpu.synchronize()
+            update_mem(_input_shape)
         return res
 
     def _execute_model_spmd(
