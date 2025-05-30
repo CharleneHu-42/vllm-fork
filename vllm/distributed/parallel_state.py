@@ -42,7 +42,7 @@ import vllm.envs as envs
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.logger import init_logger
 from vllm.utils import direct_register_custom_op, supports_custom_op
-
+logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
@@ -123,6 +123,12 @@ if supports_custom_op():
         fake_impl=all_reduce_fake,
     )
 
+
+import os
+VLLM_FAKE_SEND_RECV = os.getenv("VLLM_FAKE_SEND_RECV", "0") in ("1", "true", "True")
+
+if VLLM_FAKE_SEND_RECV:
+    logger.warning_once(f"Enabled VLLM_FAKE_SEND_RECV. ")
 
 class GroupCoordinator:
     """
@@ -679,6 +685,9 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return tensor_dict
+        
+        if VLLM_FAKE_SEND_RECV:
+            return tensor_dict
 
         all_gather_size = (1 if all_gather_group is None else
                            all_gather_group.world_size)
@@ -759,9 +768,12 @@ class GroupCoordinator:
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
-                tensor = torch.empty(value.size,
+                tensor = torch.randn(value.size,
                                      dtype=value.dtype,
                                      device=value.device)
+                if VLLM_FAKE_SEND_RECV:
+                    tensor_dict[key] = tensor
+                    continue
                 if tensor.numel() == 0:
                     # Skip broadcasting empty tensors.
                     tensor_dict[key] = tensor
