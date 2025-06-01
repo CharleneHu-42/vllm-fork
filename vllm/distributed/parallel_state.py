@@ -25,6 +25,7 @@ import contextlib
 import gc
 import pickle
 import weakref
+import torch.distributed as dist
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -46,6 +47,9 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+from vllm.platforms import current_platform
+if current_platform.is_hpu:
+    import habana_frameworks.torch.core as htcore
 
 @dataclass
 class GraphCaptureContext:
@@ -126,10 +130,32 @@ if supports_custom_op():
 
 import os
 VLLM_FAKE_SEND_RECV = os.getenv("VLLM_FAKE_SEND_RECV", "0") in ("1", "true", "True")
+VLLM_REPLACE_SEND_RECV_WITH_ALL_REDUCE = os.getenv("VLLM_REPLACE_SEND_RECV_WITH_ALL_REDUCE", "0") in ("1", "true", "True")
 
 if VLLM_FAKE_SEND_RECV:
     logger.warning_once(f"Enabled VLLM_FAKE_SEND_RECV. ")
 
+if VLLM_REPLACE_SEND_RECV_WITH_ALL_REDUCE:
+    logger.warning_once(
+        "Enabled VLLM_REPLACE_SEND_RECV_WITH_ALL_REDUCE. "
+    )
+
+
+import sys
+import pdb
+
+class ForkedPdb(pdb.Pdb):
+    """A Pdb subclass that may be used
+    from a forked multiprocessing child
+
+    """
+    def interaction(self, *args, **kwargs):
+        _stdin = sys.stdin
+        try:
+            sys.stdin = open('/dev/stdin')
+            pdb.Pdb.interaction(self, *args, **kwargs)
+        finally:
+            sys.stdin = _stdin
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -735,9 +761,39 @@ class GroupCoordinator:
                 tensor = tensor.to(orig_device)
             else:
                 # use group for GPU tensors
-                torch.distributed.send(tensor,
-                                       dst=self.ranks[dst],
-                                       group=group)
+                # logger.info(
+                #     f"[rank: {torch.distributed.get_rank()}] [self.rank_in_group: {self.rank_in_group}]"
+                #     f"Sending tensor {tensor.size()} to rank {self.ranks[dst]}"
+                #     f" group: {group.size()}."
+                # )
+                # within group
+                if VLLM_REPLACE_SEND_RECV_WITH_ALL_REDUCE:
+                    src_rank_in_world = torch.distributed.get_rank()
+                    dst_rank_in_world = self.ranks[dst]
+                    pp_send_recv_group = _PP_SEND_RECV_GROUPS[(src_rank_in_world, dst_rank_in_world)]
+                    # logger.info(
+                    #     f"[rank: {torch.distributed.get_rank()}] [self.rank_in_group: {self.rank_in_group}] "
+                    #     f"Sending tensor {tensor.size()} from rank {src_rank_in_world} to rank {dst_rank_in_world} "
+                    #     # f"using group {group.size()}."
+                    #     # f"using group : { _PP_SEND_GROUPS[local_rank].ranks}"
+                        
+                    #     )
+                    # pp_send_recv_group.all_reduce(
+                    #     tensor,
+                    #     #   op=torch.distributed.ReduceOp.SUM
+                    # )
+                    
+                    htcore.mark_step()
+                    dist.all_reduce(tensor, group=pp_send_recv_group, op=torch.distributed.ReduceOp.SUM)
+                    # logger.info(
+                    #     f"[rank: {torch.distributed.get_rank()}] [self.rank_in_group: {self.rank_in_group}] "
+                    #     f"sent done"
+                    #     )
+                    
+                else: 
+                    torch.distributed.send(tensor,
+                                        dst=self.ranks[dst],
+                                        group=group)
         return None
 
     def recv_tensor_dict(
@@ -768,7 +824,7 @@ class GroupCoordinator:
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
-                tensor = torch.randn(value.size,
+                tensor = torch.zeros(value.size,
                                      dtype=value.dtype,
                                      device=value.device)
                 if VLLM_FAKE_SEND_RECV:
@@ -803,9 +859,37 @@ class GroupCoordinator:
                     tensor = tensor.to(orig_device)
                 else:
                     # use group for GPU tensors
-                    torch.distributed.recv(tensor,
-                                           src=self.ranks[src],
-                                           group=group)
+                    # logger.info(
+                    #     f"[rank: {torch.distributed.get_rank()}][self.rank_in_group: {self.rank_in_group}] "
+                    #     f"Receiving tensor {tensor.size()} from rank {self.ranks[src]}"
+                    #     f" group: {group.size()}."
+                    # )
+                    if VLLM_REPLACE_SEND_RECV_WITH_ALL_REDUCE:
+                        src_rank_in_world = self.ranks[src]
+                        dst_rank_in_world = torch.distributed.get_rank()
+                        # pp_send_recv_group = _PP_RECV_GROUP
+                        pp_send_recv_group = _PP_SEND_RECV_GROUPS[(src_rank_in_world, dst_rank_in_world)]
+                        # logger.info(
+                        #     f"[rank: {torch.distributed.get_rank()}][self.rank_in_group: {self.rank_in_group}] "
+                        #     f"Receiving tensor {tensor.size()} from rank {src_rank_in_world} to rank {dst_rank_in_world} "
+                        # )
+                        
+                        # torch.distributed.all_reduce(
+                        #     tensor, group=pp_send_recv_group, op=torch.distributed.ReduceOp.SUM)
+                        # pp_send_recv_group.all_reduce(
+                        #     tensor,
+                        #     #   op=torch.distributed.ReduceOp.SUM
+                        # )
+                        htcore.mark_step()
+                        dist.all_reduce(tensor, group=pp_send_recv_group, op=torch.distributed.ReduceOp.SUM)
+                        # logger.info(
+                        #     f"[rank: {torch.distributed.get_rank()}][self.rank_in_group: {self.rank_in_group}] "
+                        #     f"received done"
+                        # )
+                    else:
+                        torch.distributed.recv(tensor,
+                                            src=self.ranks[src],
+                                            group=group)
                 if use_all_gather:
                     # do the allgather
                     tensor = all_gather_group.all_gather(  # type: ignore
@@ -919,6 +1003,8 @@ def init_model_parallel_group(
         force_cpu_for_pp=envs.VLLM_PP_USE_CPU_COMS \
             if group_name.lower() == "pp" else False,
     )
+
+
 
 
 _TP: Optional[GroupCoordinator] = None
@@ -1046,6 +1132,35 @@ def init_distributed_environment(
             "world group already initialized with a different world size")
 
 
+_PP_SEND_RECV_GROUPS = {}
+
+def init_pp_send_recv_groups():
+    pp_size = get_pp_group().world_size
+    tp_size = get_tp_group().world_size
+    ranks = torch.arange(pp_size * tp_size).view(pp_size, tp_size)
+    logger.info(f"ranks: {ranks}")
+    all_pairs = []
+    for i in range(pp_size - 1):
+        send_ranks = ranks[i, :]
+        recv_ranks = ranks[i + 1, :]
+        for send_rank, recv_rank in zip(send_ranks, recv_ranks):
+            all_pairs.append((send_rank.item(), recv_rank.item()))
+    logger.info(f"all_pairs: {all_pairs}")
+    for rank_pair in all_pairs:
+        # group = init_model_parallel_group(
+        #     group_ranks=[rank_pair],
+        #     local_rank=get_world_group().local_rank,
+        #     backend="hccl",
+        #     use_custom_allreduce=False,
+        #     group_name=f"pp_send_recv_group_{rank_pair[0]}_{rank_pair[1]}",
+        # )
+        group = torch.distributed.new_group(rank_pair, backend="hccl")
+        _PP_SEND_RECV_GROUPS[rank_pair] = group
+        logger.info(
+            f"[rank: {torch.distributed.get_rank()}], Created PP send group with ranks: {rank_pair}"
+        )
+
+
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
@@ -1130,11 +1245,15 @@ def initialize_model_parallel(
                                     get_world_group().local_rank,
                                     backend,
                                     group_name="dp")
+    
+    if VLLM_REPLACE_SEND_RECV_WITH_ALL_REDUCE:
+        init_pp_send_recv_groups()
+
 
     logger.info(
         "rank %s in world size %s is assigned as "
         "DP rank %s, PP rank %s, TP rank %s, is pp last rank %s, "
-        "is pp first rank %s, pp world size %s, ranks %s",
+        "is pp first rank %s, pp world size %s, PP ranks %s, TP ranks %s",
         rank,
         world_size,
         _DP.rank_in_group,
@@ -1143,9 +1262,11 @@ def initialize_model_parallel(
         _PP.is_last_rank,
         _PP.is_first_rank,
         _PP.world_size,
-        _PP.ranks
+        _PP.ranks,
+        _TP.ranks,
     )
-
+    
+    torch.distributed.barrier()
 
 def ensure_kv_transfer_initialized(vllm_config: "VllmConfig") -> None:
     """
