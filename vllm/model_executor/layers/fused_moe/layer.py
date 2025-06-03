@@ -863,8 +863,10 @@ class FusedMoE(torch.nn.Module):
             if output_tensor.ndim == 3 and x.ndim == 2:
                 output_tensor.view(-1, x.size(1))
         # All-gather.
-        torch.distributed.all_gather_into_tensor(output_tensor, x,
-                                                 group=get_dp_group().device_group)
+        VLLM_FAKE_ALL_GATHER = os.getenv("VLLM_FAKE_ALL_GATHER", "0") in ("1", "true", "True")
+        if not VLLM_FAKE_ALL_GATHER:
+            torch.distributed.all_gather_into_tensor(output_tensor, x,
+                                                    group=get_dp_group().device_group)
         return output_tensor
 
     def naive_multicast(self, x: torch.Tensor,

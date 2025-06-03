@@ -41,7 +41,7 @@ from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
 logger = init_logger(__name__)
 
 
-
+VLLM_DUMP_STEP_MEM_PATH = os.getenv("VLLM_DUMP_STEP_MEM_PATH", "vllm_memory_stats")
 def update_mem():
     import torch
 
@@ -49,7 +49,7 @@ def update_mem():
     from vllm_hpu_extension.profiler import HabanaMemoryProfiler, format_bytes
     memory_stats = torch.hpu.memory.memory_stats()
     local_rank = torch.distributed.get_rank()
-    csv_file = f"vllm_memory_stats_pp_rank_{local_rank}.csv"
+    csv_file = f"{VLLM_DUMP_STEP_MEM_PATH}_rank{local_rank}.csv"
 
     # Define the field names (header)
     fieldnames = [
@@ -349,8 +349,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         output = LocalOrDistributedWorkerBase.execute_model(
             self, execute_model_req)
         return output
-        
-    
+
     @torch.inference_mode()
     def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Profiles the peak memory usage of the model to determine how many

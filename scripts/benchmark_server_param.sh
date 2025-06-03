@@ -45,6 +45,17 @@ PORT=${12:-8688}
 MODEL_PATH=${13:-${MODEL_PATH:-/root/.cache/huggingface/DeepSeek-R1-BF16-w8afp8-dynamic-no-ste-G2}}
 RESULTS_DIR=${14:-logs/test-results}
 
+export RAY_DEDUP_LOGS=0
+export VLLM_HPU_LOG_STEP_GRAPH_COMPILATION=1
+export PT_HPU_METRICS_GC_DETAILS=1
+export VLLM_DUMP_STEP_MEM=1
+export VLLM_DUMP_STEP_MEM_PATH=${RESULTS_DIR}/memory_stats_mml${MAX_MODEL_LEN}_conc${MAX_NUM_SEQS}
+export VLLM_FAKE_SEND_RECV=0
+export VLLM_REPLACE_SEND_RECV_WITH_ALL_REDUCE=0
+export VLLM_FAKE_ALL_GATHER=0
+export VLLM_ALL_REDUCE_NO_MARK_STEP=0
+export VLLM_ALL_GATHER_NO_MARK_STEP=0
+
 if [ "$DO_PROFILE" == "true" ]; then
   hl-prof-config --use-template profile_api --hw-trace off
   export HABANA_PROFILE=1
@@ -126,9 +137,6 @@ decode_block_max=$(( ((MAX_NUM_SEQS * MAX_MODEL_LEN / BLOCK_SIZE) > 128) ? (MAX_
 export VLLM_DECODE_BLOCK_BUCKET_MIN=${VLLM_DECODE_BLOCK_BUCKET_MIN:-$decode_block_min}
 export VLLM_DECODE_BLOCK_BUCKET_STEP=${VLLM_DECODE_BLOCK_BUCKET_STEP:-$decode_block_step}
 export VLLM_DECODE_BLOCK_BUCKET_MAX=${VLLM_DECODE_BLOCK_BUCKET_MAX:-$decode_block_max}
-
-
-
 
 echo "Environments set for ${NUM_NODES}-node server: MAX_MODEL_LEN=${MAX_MODEL_LEN}, MAX_NUM_SEQS=${MAX_NUM_SEQS}, TP_SIZE=${TP_SIZE}, PP_SIZE=${PP_SIZE}, COMM_BACKEND=${COMM_BACKEND}"
 env | grep VLLM

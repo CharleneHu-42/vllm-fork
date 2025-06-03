@@ -131,6 +131,9 @@ if supports_custom_op():
 import os
 VLLM_FAKE_SEND_RECV = os.getenv("VLLM_FAKE_SEND_RECV", "0") in ("1", "true", "True")
 VLLM_REPLACE_SEND_RECV_WITH_ALL_REDUCE = os.getenv("VLLM_REPLACE_SEND_RECV_WITH_ALL_REDUCE", "0") in ("1", "true", "True")
+VLLM_FAKE_ALL_GATHER = os.getenv("VLLM_FAKE_ALL_GATHER", "0") in ("1", "true", "True")
+VLLM_ALL_REDUCE_NO_MARK_STEP = os.getenv("VLLM_ALL_REDUCE_NO_MARK_STEP", "0") in ("1", "true", "True")
+VLLM_ALL_GATHER_NO_MARK_STEP = os.getenv("VLLM_ALL_GATHER_NO_MARK_STEP", "0") in ("1", "true", "True")
 
 if VLLM_FAKE_SEND_RECV:
     logger.warning_once(f"Enabled VLLM_FAKE_SEND_RECV. ")
@@ -140,6 +143,20 @@ if VLLM_REPLACE_SEND_RECV_WITH_ALL_REDUCE:
         "Enabled VLLM_REPLACE_SEND_RECV_WITH_ALL_REDUCE. "
     )
 
+if VLLM_FAKE_ALL_GATHER:
+    logger.warning_once(
+        "Enabled VLLM_FAKE_ALL_GATHER. "
+    )
+
+if VLLM_ALL_REDUCE_NO_MARK_STEP:
+    logger.warning_once(
+        "Enabled VLLM_ALL_REDUCE_NO_MARK_STEP. "
+    )
+
+if VLLM_ALL_GATHER_NO_MARK_STEP:
+    logger.warning_once(
+        "Enabled VLLM_ALL_GATHER_NO_MARK_STEP. "
+    )
 
 import sys
 import pdb
@@ -383,7 +400,8 @@ class GroupCoordinator:
 
         if self.hpu_communicator is not None and \
             not self.hpu_communicator.disabled:
-            return self.hpu_communicator.all_reduce(input_)
+            return self.hpu_communicator.all_reduce(input_,
+                                                    no_mark=VLLM_ALL_REDUCE_NO_MARK_STEP)
 
         if self.xpu_communicator is not None and \
                 not self.xpu_communicator.disabled:
@@ -428,7 +446,9 @@ class GroupCoordinator:
         # For HPUs, use HPU communicator.
         hpu_comm = self.hpu_communicator
         if hpu_comm is not None and not hpu_comm.disabled:
-            return hpu_comm.all_gather(input_, dim)
+            return hpu_comm.all_gather(input_, dim,
+                                       fake=VLLM_FAKE_ALL_GATHER,
+                                       no_mark=VLLM_ALL_GATHER_NO_MARK_STEP)
 
         if dim < 0:
             # Convert negative dim to positive.
@@ -443,9 +463,10 @@ class GroupCoordinator:
                                     dtype=input_.dtype,
                                     device=input_.device)
         # All-gather.
-        torch.distributed.all_gather_into_tensor(output_tensor,
-                                                 input_,
-                                                 group=self.device_group)
+        if not VLLM_FAKE_ALL_GATHER:
+            torch.distributed.all_gather_into_tensor(output_tensor,
+                                                    input_,
+                                                    group=self.device_group)
         # Reshape
         output_tensor = output_tensor.reshape((world_size, ) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
@@ -711,7 +732,6 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return tensor_dict
-
 
         all_gather_size = (1 if all_gather_group is None else
                            all_gather_group.world_size)
@@ -1003,8 +1023,6 @@ def init_model_parallel_group(
         force_cpu_for_pp=envs.VLLM_PP_USE_CPU_COMS \
             if group_name.lower() == "pp" else False,
     )
-
-
 
 
 _TP: Optional[GroupCoordinator] = None

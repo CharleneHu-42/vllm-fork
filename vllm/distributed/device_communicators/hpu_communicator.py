@@ -20,15 +20,16 @@ class HpuCommunicator:
         self.group = group
         self.world_size = dist.get_world_size(self.group)
 
-    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+    def all_reduce(self, x: torch.Tensor, no_mark: bool = False) -> torch.Tensor:
         # FIXME(kzawora): this is a workaround for a bug in Habana PT bridge
         # occurring when PT_HPU_ENABLE_LAZY_COLLECTIVES=true env var is used
         # (which is required for tensor parallel HPUGraph inference)
-        htorch.core.mark_step()
+        if not no_mark:
+            htorch.core.mark_step()
         dist.all_reduce(x, group=self.group)
         return x
 
-    def all_gather(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    def all_gather(self, x: torch.Tensor, dim: int = -1, fake: bool = False, no_mark: bool = False) -> torch.Tensor:
         world_size = self.world_size
         if dim < 0:
             # Convert negative dim to positive.
@@ -44,8 +45,10 @@ class HpuCommunicator:
                                     dtype=x.dtype,
                                     device=x.device)
         # All-gather.
-        htorch.core.mark_step()
-        dist.all_gather_into_tensor(output_tensor, x, group=self.group)
+        if not no_mark:
+            htorch.core.mark_step()
+        if not fake:
+            dist.all_gather_into_tensor(output_tensor, x, group=self.group)
         # Reshape
         if dim != 0:
             output_tensor = output_tensor.movedim(0, dim)

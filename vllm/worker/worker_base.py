@@ -255,7 +255,7 @@ class WorkerInput:
 
         return tensor_dict
 
-
+VLLM_DUMP_STEP_MEM_PATH = os.getenv("VLLM_DUMP_STEP_MEM_PATH", "vllm_memory_stats")
 def update_mem(shape=None):
     import torch
 
@@ -263,7 +263,7 @@ def update_mem(shape=None):
     from vllm_hpu_extension.profiler import HabanaMemoryProfiler, format_bytes
     memory_stats = torch.hpu.memory.memory_stats()
     local_rank = torch.distributed.get_rank()
-    csv_file = f"vllm_memory_stats_pp_rank_{local_rank}.csv"
+    csv_file = f"{VLLM_DUMP_STEP_MEM_PATH}_rank{local_rank}.csv"
 
     # Define the field names (header)
     fieldnames = [
