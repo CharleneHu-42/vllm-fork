@@ -132,6 +132,7 @@ import os
 VLLM_FAKE_SEND_RECV = os.getenv("VLLM_FAKE_SEND_RECV", "0") in ("1", "true", "True")
 VLLM_REPLACE_SEND_RECV_WITH_ALL_REDUCE = os.getenv("VLLM_REPLACE_SEND_RECV_WITH_ALL_REDUCE", "0") in ("1", "true", "True")
 VLLM_FAKE_ALL_GATHER = os.getenv("VLLM_FAKE_ALL_GATHER", "0") in ("1", "true", "True")
+VLLM_PP_ALL_GATHER_USE_GLOO = os.getenv("VLLM_PP_ALL_GATHER_USE_GLOO", "0") in ("1", "true", "True")
 VLLM_ALL_REDUCE_NO_MARK_STEP = os.getenv("VLLM_ALL_REDUCE_NO_MARK_STEP", "0") in ("1", "true", "True")
 VLLM_ALL_GATHER_NO_MARK_STEP = os.getenv("VLLM_ALL_GATHER_NO_MARK_STEP", "0") in ("1", "true", "True")
 
@@ -146,6 +147,11 @@ if VLLM_REPLACE_SEND_RECV_WITH_ALL_REDUCE:
 if VLLM_FAKE_ALL_GATHER:
     logger.warning_once(
         "Enabled VLLM_FAKE_ALL_GATHER. "
+    )
+
+if VLLM_PP_ALL_GATHER_USE_GLOO:
+    logger.warning_once(
+        "Enabled VLLM_PP_ALL_GATHER_USE_GLOO. "
     )
 
 if VLLM_ALL_REDUCE_NO_MARK_STEP:
@@ -289,7 +295,7 @@ class GroupCoordinator:
             HpuCommunicator)
         self.hpu_communicator: Optional[HpuCommunicator]
         if use_hpu_communicator and self.world_size > 1:
-            self.hpu_communicator = HpuCommunicator(group=self.device_group)
+            self.hpu_communicator = HpuCommunicator(group=self.device_group, cpu_group=self.cpu_group)
 
         from vllm.distributed.device_communicators.xpu_communicator import (
             XpuCommunicator)
@@ -430,7 +436,7 @@ class GroupCoordinator:
             torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    def all_gather(self, input_: torch.Tensor, dim: int = -1, cpu: bool = False) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
@@ -448,7 +454,8 @@ class GroupCoordinator:
         if hpu_comm is not None and not hpu_comm.disabled:
             return hpu_comm.all_gather(input_, dim,
                                        fake=VLLM_FAKE_ALL_GATHER,
-                                       no_mark=VLLM_ALL_GATHER_NO_MARK_STEP)
+                                       no_mark=VLLM_ALL_GATHER_NO_MARK_STEP,
+                                       cpu=cpu)
 
         if dim < 0:
             # Convert negative dim to positive.
@@ -466,7 +473,7 @@ class GroupCoordinator:
         if not VLLM_FAKE_ALL_GATHER:
             torch.distributed.all_gather_into_tensor(output_tensor,
                                                     input_,
-                                                    group=self.device_group)
+                                                    group=self.cpu_group if cpu else self.device_group)
         # Reshape
         output_tensor = output_tensor.reshape((world_size, ) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
@@ -912,8 +919,14 @@ class GroupCoordinator:
                                             group=group)
                 if use_all_gather:
                     # do the allgather
+                    orig_device = tensor.device
+                    if VLLM_PP_ALL_GATHER_USE_GLOO:
+                        # use metadata_group for CPU tensors
+                        tensor = tensor.to('cpu')
                     tensor = all_gather_group.all_gather(  # type: ignore
-                        tensor, dim=0)
+                        tensor, dim=0, cpu=VLLM_PP_ALL_GATHER_USE_GLOO)
+                    if VLLM_PP_ALL_GATHER_USE_GLOO:
+                        tensor = tensor.to(orig_device)
                     tensor = tensor.reshape(orig_shape)
 
                 tensor_dict[key] = tensor

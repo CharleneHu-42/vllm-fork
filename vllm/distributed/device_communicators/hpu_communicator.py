@@ -12,12 +12,13 @@ if current_platform.is_hpu():
 
 class HpuCommunicator:
 
-    def __init__(self, group: ProcessGroup):
+    def __init__(self, group: ProcessGroup, cpu_group: ProcessGroup = None):
         if not current_platform.is_hpu():
             self.disabled = True
             return
         self.disabled = False
         self.group = group
+        self.cpu_group = cpu_group
         self.world_size = dist.get_world_size(self.group)
 
     def all_reduce(self, x: torch.Tensor, no_mark: bool = False) -> torch.Tensor:
@@ -29,7 +30,7 @@ class HpuCommunicator:
         dist.all_reduce(x, group=self.group)
         return x
 
-    def all_gather(self, x: torch.Tensor, dim: int = -1, fake: bool = False, no_mark: bool = False) -> torch.Tensor:
+    def all_gather(self, x: torch.Tensor, dim: int = -1, fake: bool = False, no_mark: bool = False, cpu: bool = False) -> torch.Tensor:
         world_size = self.world_size
         if dim < 0:
             # Convert negative dim to positive.
@@ -48,7 +49,7 @@ class HpuCommunicator:
         if not no_mark:
             htorch.core.mark_step()
         if not fake:
-            dist.all_gather_into_tensor(output_tensor, x, group=self.group)
+            dist.all_gather_into_tensor(output_tensor, x, group=self.cpu_group if cpu else self.group)
         # Reshape
         if dim != 0:
             output_tensor = output_tensor.movedim(0, dim)
